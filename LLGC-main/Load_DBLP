@@ -1,0 +1,278 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+import networkx as nx
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import precision_score, recall_score, f1_score
+import random
+import scipy.sparse as sp
+from time import perf_counter
+
+# === import your LLGC components ===
+from utils import load_citation  # keep if you want the old datasets
+from model import LLGC, PageRankAgg
+
+
+# ==========================================================
+# === 1. Utility functions
+# ==========================================================
+
+def find_column(df, candidates):
+    cols = list(df.columns)
+    lowcols = [c.lower().strip() for c in cols]
+    for cand in candidates:
+        if cand.lower() in lowcols:
+            return cols[lowcols.index(cand.lower())]
+    for cand in candidates:
+        for i, lc in enumerate(lowcols):
+            if cand.lower() in lc:
+                return cols[i]
+    return None
+
+
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
+
+
+# ==========================================================
+# === 2. Load your custom citation dataset
+# ==========================================================
+
+def load_custom_dataset(csv_path, cuda=True):
+    df = pd.read_csv(csv_path, sep=',', engine='python')
+    df.columns = df.columns.str.strip()
+
+    title_col = find_column(df, ['title'])
+    authors_col = find_column(df, ['authors.name', 'authors'])
+    fos_col = find_column(df, ['fos.name', 'fos'])
+    id_col = find_column(df, ['id'])
+    refs_col = find_column(df, ['references', 'refs'])
+    year_col = find_column(df, ['year'])
+
+    print('Using columns:', dict(title=title_col, authors=authors_col,
+                                 fos=fos_col, id=id_col, references=refs_col))
+
+    # combine textual data
+    combined_text = df[title_col].astype(str) + ' ' + df[authors_col].astype(str) + ' ' + df[fos_col].astype(str)
+    vectorizer = TfidfVectorizer(max_features=1000)
+    features = vectorizer.fit_transform(combined_text)
+
+    label_encoder = LabelEncoder()
+    labels = label_encoder.fit_transform(df[fos_col])
+
+    G = nx.DiGraph()
+    ids = df[id_col].astype(str).tolist()
+    id_to_idx = {pid: i for i, pid in enumerate(ids)}
+    G.add_nodes_from(range(len(ids)))
+
+    for i, refs in enumerate(df[refs_col]):
+        try:
+            refs_list = eval(refs) if isinstance(refs, str) else []
+            for ref in refs_list:
+                if ref in id_to_idx:
+                    G.add_edge(i, id_to_idx[ref])
+        except Exception:
+            continue
+
+    adj = nx.adjacency_matrix(G)
+    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+
+    n = len(df)
+    idx_train = torch.arange(int(0.6 * n))
+    idx_val = torch.arange(int(0.6 * n), int(0.8 * n))
+    idx_test = torch.arange(int(0.8 * n), n)
+
+    features = torch.FloatTensor(np.array(features.todense()))
+    labels = torch.LongTensor(labels)
+    adj = sparse_mx_to_torch_sparse_tensor(adj).float()
+
+    if cuda and torch.cuda.is_available():
+        features, labels, adj = features.cuda(), labels.cuda(), adj.cuda()
+        idx_train, idx_val, idx_test = idx_train.cuda(), idx_val.cuda(), idx_test.cuda()
+
+    return df, adj, features, labels, idx_train, idx_val, idx_test, G, year_col
+
+
+# ==========================================================
+# === 3. Temporal segmentation
+# ==========================================================
+
+def temporal_segmentation(df, year_col):
+    df = df.dropna(subset=[year_col])
+    df[year_col] = df[year_col].astype(int)
+    years = sorted(df[year_col].unique())
+    subgraphs = [(year, df[df[year_col] <= year]) for year in years]
+    return subgraphs
+
+
+# ==========================================================
+# === 4. Train & run LLGC model (real)
+# ==========================================================
+
+def train_llgc(features, adj, labels, idx_train, idx_val, idx_test, args):
+    sgconv = PageRankAgg(K=args["K"], alpha=args["alpha"]).to("cuda")
+    x_gconv, precompute_time = sgconv(features, adj._indices(), None)
+
+    model = LLGC(x_gconv.size(1), labels.max().item() + 1,
+                 args["drop_out"], args["use_bias"]).cuda()
+
+    optimizer = optim.Adam(model.parameters(),
+                           lr=args["lr"], weight_decay=args["weight_decay"])
+
+    t0 = perf_counter()
+    for epoch in range(args["epochs"]):
+        model.train()
+        optimizer.zero_grad()
+        out = model(x_gconv[idx_train])
+        loss = F.cross_entropy(out, labels[idx_train])
+        loss.backward()
+        optimizer.step()
+    train_time = perf_counter() - t0
+
+    model.eval()
+    acc_test = accuracy(model(x_gconv[idx_test]), labels[idx_test])
+    print(f"LLGC Accuracy: {acc_test:.4f}, train {train_time:.2f}s, precomp {precompute_time:.2f}s")
+
+    return model, x_gconv.detach().cpu().numpy()
+
+
+def accuracy(output, labels):
+    preds = output.argmax(dim=1).type_as(labels)
+    correct = preds.eq(labels).double().sum().item()
+    return correct / len(labels)
+
+
+# ==========================================================
+# === 5. Anomaly Detection
+# ==========================================================
+
+def lorentz_to_euclidean(embeddings):
+    if embeddings.shape[1] < 2:
+        return embeddings
+    euc = embeddings[:, 1:]
+    norm = np.linalg.norm(euc, axis=1, keepdims=True)
+    return euc / np.maximum(norm, 1e-9)
+
+
+def anomaly_detection_temporal(temporal_embeddings):
+    anomaly_scores = {}
+    for year, emb in temporal_embeddings.items():
+        emb_euc = lorentz_to_euclidean(emb)
+        if emb_euc.shape[0] < 5:
+            continue
+        clf = IsolationForest(contamination=0.1, random_state=42)
+        clf.fit(emb_euc)
+        scores = -clf.decision_function(emb_euc)
+        anomaly_scores[year] = scores
+    return anomaly_scores
+
+
+# ==========================================================
+# === 6. Optional: Synthetic Anomaly Injection + Evaluation
+# ==========================================================
+
+def inject_synthetic_anomalies(G, ratio=0.05, connect_ratio=0.3):
+    nodes = list(G.nodes())
+    num_anomalies = int(len(nodes) * ratio)
+    anomalies = random.sample(nodes, num_anomalies)
+    for node in anomalies:
+        random_targets = random.sample(nodes, int(len(nodes) * connect_ratio))
+        for t in random_targets:
+            G.add_edge(node, t)
+    return G, anomalies
+
+
+def evaluate_detection(pred_scores, true_anomalies, threshold=0.7):
+    preds = (pred_scores > threshold).astype(int)
+    y_true = np.zeros_like(preds)
+    y_true[true_anomalies] = 1
+    print(pred_scores)
+    print()
+    return {
+        "precision": precision_score(y_true, preds, zero_division=0),
+        "recall": recall_score(y_true, preds, zero_division=0),
+        "f1": f1_score(y_true, preds, zero_division=0)
+    }
+    
+
+
+# ==========================================================
+# === 7. Main pipeline
+# ==========================================================
+
+def main(file_path):
+    args = {
+        "lr": 0.6,
+        "weight_decay": 3e-5,
+        "epochs": 200,
+        "K": 20,
+        "alpha": 0.1,
+        "drop_out": 0.0,
+        "use_bias": 1,
+    }
+
+    print("Loading dataset...")
+    df, adj, features, labels, idx_train, idx_val, idx_test, G, year_col = load_custom_dataset(file_path)
+    subgraphs = temporal_segmentation(df, year_col)
+
+    temporal_embeddings = {}
+    for year, sub_df in subgraphs:
+        print(f"Processing subgraph up to year {year} ({len(sub_df)} papers)")
+        # same features/adj now used for demonstration; in full implementation, rebuild per year
+        _, emb = train_llgc(features, adj, labels, idx_train, idx_val, idx_test, args)
+        temporal_embeddings[year] = emb
+
+    anomaly_scores = anomaly_detection_temporal(temporal_embeddings)
+
+    # show top anomalies per year
+    for year, scores in anomaly_scores.items():
+        df_sub = df[df[year_col] <= year].copy()
+        # scores are typically computed over the full node list (aligned to df rows)
+        # but in some implementations they may already be per-subgraph. Handle both.
+        try:
+            if isinstance(scores, np.ndarray) and len(scores) == len(df):
+                subset_scores = np.take(scores, df_sub.index.values)
+            elif isinstance(scores, (list, np.ndarray)) and len(scores) == len(df_sub):
+                subset_scores = np.array(scores)
+            else:
+                # fallback: try to index by df_sub's positional indices if possible
+                subset_scores = np.take(np.array(scores), df_sub.index.values)
+        except Exception:
+            # if anything goes wrong, fill with zeros to avoid crashing and log a message
+            print(f"Warning: could not align anomaly scores for year {year} (scores_len={len(scores)}, sub_len={len(df_sub)}). Filling with zeros.")
+            subset_scores = np.zeros(len(df_sub))
+
+        df_sub.loc[:, 'anomaly_score'] = subset_scores
+        print(f"\n=== Top anomalies for year {year} ===")
+        # use find_column-safeguarded name 'title' may not exist; fall back to first textual column
+        title_col = find_column(df_sub, ['title', 'name']) or df_sub.columns[0]
+        print(df_sub.nlargest(5, 'anomaly_score')[[title_col, 'anomaly_score']])
+
+    # optional validation
+    print("\nInjecting synthetic anomalies for validation...")
+    G_anom, true_anoms = inject_synthetic_anomalies(G)
+    # Replace with actual computed scores
+    all_scores = anomaly_scores[max(anomaly_scores.keys())]  # e.g., latest year’s scores
+
+    # Clip to match number of nodes
+    all_scores = all_scores[:len(G_anom)]
+    results = evaluate_detection(all_scores, true_anoms)
+
+    print(f"Validation Results → Precision: {results['precision']:.3f}, Recall: {results['recall']:.3f}, F1: {results['f1']:.3f}")
+
+
+# ==========================================================
+# === Run
+# ==========================================================
+
+if __name__ == "__main__":
+    FILE_PATH = "C:\\Users\\nadir\\OneDrive\\Desktop\\final_filtered_by_fos_and_reference (1).csv"
+    main(FILE_PATH)
