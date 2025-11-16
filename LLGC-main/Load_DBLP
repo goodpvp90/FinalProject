@@ -12,14 +12,53 @@ import random
 import scipy.sparse as sp
 from time import perf_counter
 
-# === import your LLGC components ===
-from utils import load_citation  # keep if you want the old datasets
+# === Import your LLGC components ===
+# Ensure model.py is in the same directory
 from model import LLGC, PageRankAgg
 
+# ==========================================================
+# === 1. L²GC Math Helper Functions (REQUIRED)
+# These implement the math described in your doc [cite: 208-216]
+# ==========================================================
 
-# ==========================================================
-# === 1. Utility functions
-# ==========================================================
+def expmap(v, k=1.0):
+    """Maps Euclidean tangent space features to Hyperbolic space."""
+    # v is in tangent space at origin. v[0] is usually 0.
+    v_spatial = v[..., 1:]
+    norm_v_spatial = torch.norm(v_spatial, dim=-1, keepdim=True).clamp_min(1e-9)
+    
+    # In Lorentz model with curvature k, calculations follow:
+    cosh_alpha = torch.cosh(norm_v_spatial)
+    sinh_alpha = torch.sinh(norm_v_spatial)
+    
+    x_0 = cosh_alpha
+    x_spatial = sinh_alpha * (v_spatial / norm_v_spatial)
+    
+    x = torch.cat([x_0, x_spatial], dim=-1)
+    return x
+
+def logmap(x, k=1.0):
+    """Maps Hyperbolic embeddings back to Euclidean space for Isolation Forest."""
+    x_0 = x[..., 0:1]
+    x_spatial = x[..., 1:]
+    
+    norm_x_spatial = torch.norm(x_spatial, dim=-1, keepdim=True).clamp_min(1e-9)
+    
+    # To avoid numerical instability with acosh(1.0)
+    magnitude = torch.acosh(x_0.clamp_min(1.0 + 1e-7))
+    
+    v_spatial = magnitude * (x_spatial / norm_x_spatial)
+    v_0 = torch.zeros_like(x_0)
+    
+    v = torch.cat([v_0, v_spatial], dim=-1)
+    return v
+
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
 
 def find_column(df, candidates):
     cols = list(df.columns)
@@ -33,246 +72,239 @@ def find_column(df, candidates):
                 return cols[i]
     return None
 
-
-def sparse_mx_to_torch_sparse_tensor(sparse_mx):
-    sparse_mx = sparse_mx.tocoo().astype(np.float32)
-    indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
-    values = torch.from_numpy(sparse_mx.data)
-    shape = torch.Size(sparse_mx.shape)
-    return torch.sparse.FloatTensor(indices, values, shape)
-
-
 # ==========================================================
-# === 2. Load your custom citation dataset
+# === 2. Data Loading
 # ==========================================================
 
-def load_custom_dataset(csv_path, cuda=True):
+def load_custom_dataset(csv_path):
+    print("Loading dataset...")
     df = pd.read_csv(csv_path, sep=',', engine='python')
     df.columns = df.columns.str.strip()
 
+    # Map columns
+    id_col = find_column(df, ['id'])
     title_col = find_column(df, ['title'])
     authors_col = find_column(df, ['authors.name', 'authors'])
     fos_col = find_column(df, ['fos.name', 'fos'])
-    id_col = find_column(df, ['id'])
     refs_col = find_column(df, ['references', 'refs'])
     year_col = find_column(df, ['year'])
+    
+    df.rename(columns={id_col: 'id', title_col: 'title', authors_col: 'authors', 
+                       fos_col: 'fos', refs_col: 'references', year_col: 'year'}, inplace=True)
 
-    print('Using columns:', dict(title=title_col, authors=authors_col,
-                                 fos=fos_col, id=id_col, references=refs_col))
-
-    # combine textual data
-    combined_text = df[title_col].astype(str) + ' ' + df[authors_col].astype(str) + ' ' + df[fos_col].astype(str)
+    # Generate STATIC features (TF-IDF) [cite: 300]
+    print("Generating static features...")
+    df['text'] = df['title'].astype(str) + ' ' + df['authors'].astype(str) + ' ' + df['fos'].astype(str)
     vectorizer = TfidfVectorizer(max_features=1000)
-    features = vectorizer.fit_transform(combined_text)
+    features_np = vectorizer.fit_transform(df['text']).todense()
+    features = torch.FloatTensor(np.array(features_np))
 
+    # Generate labels
     label_encoder = LabelEncoder()
-    labels = label_encoder.fit_transform(df[fos_col])
+    labels = torch.LongTensor(label_encoder.fit_transform(df['fos']))
 
+    # Build Full Graph
+    print("Building graph...")
     G = nx.DiGraph()
-    ids = df[id_col].astype(str).tolist()
+    ids = df['id'].astype(str).tolist()
     id_to_idx = {pid: i for i, pid in enumerate(ids)}
     G.add_nodes_from(range(len(ids)))
 
-    for i, refs in enumerate(df[refs_col]):
+    df['references'] = df['references'].fillna('[]')
+    for i, refs in enumerate(df['references']):
         try:
             refs_list = eval(refs) if isinstance(refs, str) else []
             for ref in refs_list:
                 if ref in id_to_idx:
                     G.add_edge(i, id_to_idx[ref])
-        except Exception:
+        except:
             continue
 
-    adj = nx.adjacency_matrix(G)
-    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-
+    # Create index sets
     n = len(df)
     idx_train = torch.arange(int(0.6 * n))
     idx_val = torch.arange(int(0.6 * n), int(0.8 * n))
     idx_test = torch.arange(int(0.8 * n), n)
 
-    features = torch.FloatTensor(np.array(features.todense()))
-    labels = torch.LongTensor(labels)
-    adj = sparse_mx_to_torch_sparse_tensor(adj).float()
-
-    if cuda and torch.cuda.is_available():
-        features, labels, adj = features.cuda(), labels.cuda(), adj.cuda()
-        idx_train, idx_val, idx_test = idx_train.cuda(), idx_val.cuda(), idx_test.cuda()
-
-    return df, adj, features, labels, idx_train, idx_val, idx_test, G, year_col
-
+    return df, features, labels, G, id_to_idx, idx_train, idx_val, idx_test
 
 # ==========================================================
-# === 3. Temporal segmentation
+# === 3. The Fixed L²GC Pipeline
 # ==========================================================
 
-def temporal_segmentation(df, year_col):
-    df = df.dropna(subset=[year_col])
-    df[year_col] = df[year_col].astype(int)
-    years = sorted(df[year_col].unique())
-    subgraphs = [(year, df[df[year_col] <= year]) for year in years]
-    return subgraphs
+def get_llgc_embeddings(features, adj, labels, idx_train, args):
+    """
+    Trains L2GC and extracts the HYPERBOLIC embeddings.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    features = features.to(device)
+    adj = adj.to(device)
+    labels = labels.to(device)
+    idx_train = idx_train.to(device)
 
+    # 1. Parameter-Free Propagation (Euclidean) [cite: 231]
+    sgconv = PageRankAgg(K=args["K"], alpha=args["alpha"]).to(device)
+    x_gconv, _ = sgconv(features, adj._indices(), None)
 
-# ==========================================================
-# === 4. Train & run LLGC model (real)
-# ==========================================================
+    # 2. Map to Hyperbolic Space [cite: 248]
+    # Pad with 0 to create the time dimension for tangent space
+    x_gconv_tangent = F.pad(x_gconv, (1, 0), 'constant', 0)
+    x_hyperbolic_input = expmap(x_gconv_tangent)
 
-def train_llgc(features, adj, labels, idx_train, idx_val, idx_test, args):
-    sgconv = PageRankAgg(K=args["K"], alpha=args["alpha"]).to("cuda")
-    x_gconv, precompute_time = sgconv(features, adj._indices(), None)
+    # 3. Train L2GC Model
+    model = LLGC(x_hyperbolic_input.size(1), labels.max().item() + 1,
+                 args["drop_out"], args["use_bias"]).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=args["lr"], weight_decay=args["weight_decay"])
 
-    model = LLGC(x_gconv.size(1), labels.max().item() + 1,
-                 args["drop_out"], args["use_bias"]).cuda()
-
-    optimizer = optim.Adam(model.parameters(),
-                           lr=args["lr"], weight_decay=args["weight_decay"])
-
-    t0 = perf_counter()
+    model.train()
     for epoch in range(args["epochs"]):
-        model.train()
         optimizer.zero_grad()
-        out = model(x_gconv[idx_train])
+        out = model(x_hyperbolic_input[idx_train])
         loss = F.cross_entropy(out, labels[idx_train])
         loss.backward()
         optimizer.step()
-    train_time = perf_counter() - t0
 
+    # 4. Extract Embeddings [cite: 302-309]
     model.eval()
-    acc_test = accuracy(model(x_gconv[idx_test]), labels[idx_test])
-    print(f"LLGC Accuracy: {acc_test:.4f}, train {train_time:.2f}s, precomp {precompute_time:.2f}s")
+    with torch.no_grad():
+        # We use the model's linear layer to get the hyperbolic transformation
+        final_hyp_emb = model.linear(x_hyperbolic_input)
+        
+        # 5. Map back to Euclidean for Isolation Forest [cite: 343-345]
+        final_euc_emb = logmap(final_hyp_emb)
 
-    return model, x_gconv.detach().cpu().numpy()
-
-
-def accuracy(output, labels):
-    preds = output.argmax(dim=1).type_as(labels)
-    correct = preds.eq(labels).double().sum().item()
-    return correct / len(labels)
-
+    return final_euc_emb.detach().cpu().numpy()
 
 # ==========================================================
-# === 5. Anomaly Detection
-# ==========================================================
-
-def lorentz_to_euclidean(embeddings):
-    if embeddings.shape[1] < 2:
-        return embeddings
-    euc = embeddings[:, 1:]
-    norm = np.linalg.norm(euc, axis=1, keepdims=True)
-    return euc / np.maximum(norm, 1e-9)
-
-
-def anomaly_detection_temporal(temporal_embeddings):
-    anomaly_scores = {}
-    for year, emb in temporal_embeddings.items():
-        emb_euc = lorentz_to_euclidean(emb)
-        if emb_euc.shape[0] < 5:
-            continue
-        clf = IsolationForest(contamination=0.1, random_state=42)
-        clf.fit(emb_euc)
-        scores = -clf.decision_function(emb_euc)
-        anomaly_scores[year] = scores
-    return anomaly_scores
-
-
-# ==========================================================
-# === 6. Optional: Synthetic Anomaly Injection + Evaluation
+# === 4. Validation Logic
 # ==========================================================
 
 def inject_synthetic_anomalies(G, ratio=0.05, connect_ratio=0.3):
-    nodes = list(G.nodes())
+    """Creates a copy of the graph with injected anomalies [cite: 365-368]."""
+    G_anom = G.copy()
+    nodes = list(G_anom.nodes())
     num_anomalies = int(len(nodes) * ratio)
     anomalies = random.sample(nodes, num_anomalies)
-    for node in anomalies:
-        random_targets = random.sample(nodes, int(len(nodes) * connect_ratio))
-        for t in random_targets:
-            G.add_edge(node, t)
-    return G, anomalies
-
-
-def evaluate_detection(pred_scores, true_anomalies, threshold=0.7):
-    preds = (pred_scores > threshold).astype(int)
-    y_true = np.zeros_like(preds)
-    y_true[true_anomalies] = 1
-    print(pred_scores)
-    print()
-    return {
-        "precision": precision_score(y_true, preds, zero_division=0),
-        "recall": recall_score(y_true, preds, zero_division=0),
-        "f1": f1_score(y_true, preds, zero_division=0)
-    }
     
+    print(f"Injecting {num_anomalies} anomalies...")
+    for node in anomalies:
+        # Anomalous behavior: randomly connecting to unrelated nodes
+        targets = random.sample(nodes, int(len(nodes) * connect_ratio))
+        for t in targets:
+            G_anom.add_edge(node, t)
+            
+    return G_anom, anomalies
 
+def evaluate_detection(pred_scores, true_anomalies_indices, total_nodes):
+    """Evaluates precision/recall/f1 [cite: 371-377]."""
+    y_true = np.zeros(total_nodes)
+    y_true[true_anomalies_indices] = 1
+    
+    # FIX: Anomalies have HIGH scores (because we negated decision_function).
+    # We want the TOP 5% scores, not bottom 5%.
+    threshold = np.percentile(pred_scores, 95) 
+    y_pred = (pred_scores > threshold).astype(int)
+    
+    return {
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0)
+    }
+
+def run_validation_pipeline(df, features, labels, G_orig, idx_train, args):
+    print("\n=== Running Validation Pipeline [cite: 365-385] ===")
+    
+    # 1. Inject anomalies into a NEW graph
+    G_anom, true_anom_indices = inject_synthetic_anomalies(G_orig)
+    
+    # 2. Rebuild adjacency matrix for the ANOMALOUS graph
+    adj_anom = nx.adjacency_matrix(G_anom)
+    adj_anom = adj_anom + adj_anom.T.multiply(adj_anom.T > adj_anom) - adj_anom.multiply(adj_anom.T > adj_anom)
+    adj_anom_torch = sparse_mx_to_torch_sparse_tensor(adj_anom).float()
+    
+    # 3. Run L2GC on the ANOMALOUS graph to get embeddings
+    # (Previously you were running it on the clean graph)
+    print("Extracting embeddings from anomalous graph...")
+    embeddings = get_llgc_embeddings(features, adj_anom_torch, labels, idx_train, args)
+    
+    # 4. Run Isolation Forest [cite: 348]
+    print("Running Isolation Forest...")
+    clf = IsolationForest(contamination=0.05, random_state=42)
+    clf.fit(embeddings)
+    # High score = Anomaly (negated decision function)
+    scores = -clf.decision_function(embeddings)
+    
+    # 5. Evaluate
+    results = evaluate_detection(scores, true_anom_indices, len(df))
+    print(f"Validation Results -> Precision: {results['precision']:.3f}, Recall: {results['recall']:.3f}, F1: {results['f1']:.3f}")
 
 # ==========================================================
-# === 7. Main pipeline
+# === 5. Main Execution
 # ==========================================================
 
 def main(file_path):
     args = {
-        "lr": 0.6,
-        "weight_decay": 3e-5,
-        "epochs": 200,
-        "K": 20,
+        "lr": 0.1,           # Lower LR often helps stability
+        "weight_decay": 5e-4,
+        "epochs": 100,
+        "K": 10,             # Propagation steps
         "alpha": 0.1,
         "drop_out": 0.0,
         "use_bias": 1,
     }
 
-    print("Loading dataset...")
-    df, adj, features, labels, idx_train, idx_val, idx_test, G, year_col = load_custom_dataset(file_path)
-    subgraphs = temporal_segmentation(df, year_col)
+    # 1. Load Data
+    df, features, labels, G, id_to_idx, idx_train, idx_val, idx_test = load_custom_dataset(file_path)
+    
+    # 2. Run Validation (Synthetic Injection)
+    # This replaces the broken validation in your previous code
+    run_validation_pipeline(df, features, labels, G, idx_train, args)
 
-    temporal_embeddings = {}
-    for year, sub_df in subgraphs:
-        print(f"Processing subgraph up to year {year} ({len(sub_df)} papers)")
-        # same features/adj now used for demonstration; in full implementation, rebuild per year
-        _, emb = train_llgc(features, adj, labels, idx_train, idx_val, idx_test, args)
-        temporal_embeddings[year] = emb
-
-    anomaly_scores = anomaly_detection_temporal(temporal_embeddings)
-
-    # show top anomalies per year
-    for year, scores in anomaly_scores.items():
-        df_sub = df[df[year_col] <= year].copy()
-        # scores are typically computed over the full node list (aligned to df rows)
-        # but in some implementations they may already be per-subgraph. Handle both.
-        try:
-            if isinstance(scores, np.ndarray) and len(scores) == len(df):
-                subset_scores = np.take(scores, df_sub.index.values)
-            elif isinstance(scores, (list, np.ndarray)) and len(scores) == len(df_sub):
-                subset_scores = np.array(scores)
-            else:
-                # fallback: try to index by df_sub's positional indices if possible
-                subset_scores = np.take(np.array(scores), df_sub.index.values)
-        except Exception:
-            # if anything goes wrong, fill with zeros to avoid crashing and log a message
-            print(f"Warning: could not align anomaly scores for year {year} (scores_len={len(scores)}, sub_len={len(df_sub)}). Filling with zeros.")
-            subset_scores = np.zeros(len(df_sub))
-
-        df_sub.loc[:, 'anomaly_score'] = subset_scores
-        print(f"\n=== Top anomalies for year {year} ===")
-        # use find_column-safeguarded name 'title' may not exist; fall back to first textual column
-        title_col = find_column(df_sub, ['title', 'name']) or df_sub.columns[0]
-        print(df_sub.nlargest(5, 'anomaly_score')[[title_col, 'anomaly_score']])
-
-    # optional validation
-    print("\nInjecting synthetic anomalies for validation...")
-    G_anom, true_anoms = inject_synthetic_anomalies(G)
-    # Replace with actual computed scores
-    all_scores = anomaly_scores[max(anomaly_scores.keys())]  # e.g., latest year’s scores
-
-    # Clip to match number of nodes
-    all_scores = all_scores[:len(G_anom)]
-    results = evaluate_detection(all_scores, true_anoms)
-
-    print(f"Validation Results → Precision: {results['precision']:.3f}, Recall: {results['recall']:.3f}, F1: {results['f1']:.3f}")
-
-
-# ==========================================================
-# === Run
-# ==========================================================
+    # 3. Temporal Analysis (Real Data) [cite: 296-297]
+    print("\n=== Running Temporal Analysis on Real Data ===")
+    df['year'] = pd.to_numeric(df['year'], errors='coerce').fillna(0).astype(int)
+    years = sorted(df['year'][df['year'] > 1900].unique())
+    
+    for year in years:
+        sub_df = df[df['year'] <= year]
+        if len(sub_df) < 50: continue
+        
+        print(f"Processing year {year} ({len(sub_df)} papers)...")
+        
+        # Get indices for this subgraph
+        indices = sub_df.index.tolist()
+        sub_features = features[indices]
+        sub_labels = labels[indices]
+        
+        # Build Subgraph Adjacency
+        G_sub = G.subgraph(indices)
+        # Relabel nodes to 0..N for the matrix
+        mapping = {old: new for new, old in enumerate(indices)}
+        G_sub_relabeled = nx.relabel_nodes(G_sub, mapping)
+        
+        adj_sub = nx.adjacency_matrix(G_sub_relabeled)
+        adj_sub = adj_sub + adj_sub.T.multiply(adj_sub.T > adj_sub) - adj_sub.multiply(adj_sub.T > adj_sub)
+        adj_sub_torch = sparse_mx_to_torch_sparse_tensor(adj_sub).float()
+        
+        # Train Split for subgraph
+        n_sub = len(sub_df)
+        idx_train_sub = torch.arange(int(0.6 * n_sub))
+        
+        # Get Embeddings & Anomaly Scores
+        emb_sub = get_llgc_embeddings(sub_features, adj_sub_torch, sub_labels, idx_train_sub, args)
+        
+        clf = IsolationForest(contamination=0.05, random_state=42)
+        clf.fit(emb_sub)
+        scores = -clf.decision_function(emb_sub)
+        
+        # Show top anomalies
+        top_idx = np.argsort(scores)[-5:] # Top 5 highest scores
+        print(f"  Top Anomalies for {year}:")
+        for idx in top_idx:
+            print(f"    - {sub_df.iloc[idx]['title'][:60]}... (Score: {scores[idx]:.3f})")
 
 if __name__ == "__main__":
+    # Replace with your actual file path
     FILE_PATH = "C:\\Users\\nadir\\OneDrive\\Desktop\\final_filtered_by_fos_and_reference (1).csv"
     main(FILE_PATH)
