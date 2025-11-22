@@ -15,7 +15,6 @@ import math
 import torch.optim as optim
 from time import perf_counter
 # Import necessary classes from your LLGC model files (LLGC-main/model.py)
-from model import LLGC, PageRankAgg
 
 # Name of the uploaded CSV file
 file_name = "final_filtered_by_fos_and_reference.csv"
