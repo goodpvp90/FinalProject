@@ -29,3 +29,69 @@ Thumbs.db
 
 # Optional: dataset cache
 data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual Environments ---
+# Commonly used names for venvs
+venv/
+env/
+.env/
+.venv/
+pyg_env/
+pyg_env*/
+
+# --- IDEs & Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- PyTorch & Models ---
+*.pt
+*.pth
+*.ckpt
+
+# --- Project Specific Data & Outputs ---
+# Ignore large input CSVs
+final_filtered_by_fos_and_reference.csv
+# Ignore generated output CSVs
+temporal_anomaly_results.csv
+
+# Ignore other large data files if you don't want them in git
+# (Uncomment lines below if you want to ignore all data folders)
+# data/
+# *.zip
+# *.tar.gz
+
+# --- Jupyter Notebooks (Optional) ---
+.ipynb_checkpoints
+
+# --- OS Generated Files ---
+.DS_Store
+Thumbs.db
+
+

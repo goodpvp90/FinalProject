@@ -87,7 +87,11 @@ class LLGC(nn.Module):
         self.drop_out = drop_out
         self.use_bias = use_bias
         self.nclass = nclass
-        self.c = torch.tensor([1.0]).to("cuda")
+        # --- FIX: Set 'c' to the correct device determined at runtime ---
+        # The tensor 'c' will now move to CPU if CUDA is unavailable.
+        current_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.c = torch.tensor([1.0]).to(current_device)
+        # ------------------------------------------------------------------
         self.manifold = getattr(manifolds, "Lorentzian")()
         self.W = LorentzLinear(self.manifold, nfeat, nclass, self.c, self.drop_out, self.use_bias)
     def forward(self, x):
