@@ -17,6 +17,9 @@ import random
 
 from model import LLGC, PageRankAgg 
 
+# --------------------------
+# 0. Set random seeds for reproducibility
+# --------------------------
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
@@ -29,19 +32,22 @@ file_name = "C:\\Users\\nadir\\FinalProject\\LLGC-main\\final_filtered_by_fos_an
 print(f"Loading data from: {file_name}")
 df = pd.read_csv(file_name)
 
+# Convert 'references' string representation of list into actual Python list
 df['references'] = df['references'].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else [])
 
 # --------------------------
 # 2. Build Graph
 # --------------------------
-G = nx.DiGraph()
+G = nx.DiGraph()  # directed graph
 paper_ids = set(df['id'])
 
+# Add nodes with attributes (excluding textual/graph-specific fields)
 for _, row in df.iterrows():
     paper_id = row['id']
     attributes = row.drop(['id','title','authors.name','year','fos.name','n_citation','references','abstract']).to_dict()
     G.add_node(paper_id, **attributes)
 
+# Add edges based on citations (references)
 for _, row in df.iterrows():
     citing_paper_id = row['id']
     for cited_paper_id in row['references']:
@@ -51,39 +57,49 @@ for _, row in df.iterrows():
 # --------------------------
 # 3. Feature Extraction
 # --------------------------
+# Combine title + abstract for textual features
 df['text_combined'] = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
 vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
-X_text = vectorizer.fit_transform(df['text_combined']).toarray()
+X_text = vectorizer.fit_transform(df['text_combined']).toarray()  # TF-IDF features
 
+# Numerical features (citations, year)
 numerical_features = df[['n_citation', 'year']].copy()
 scaler = StandardScaler()
 X_numerical = scaler.fit_transform(numerical_features)
 
+# One-hot encode field-of-study (fos.name)
 fos_encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
 X_fos = fos_encoder.fit_transform(df[['fos.name']].fillna('Unknown'))
 
+# Number of authors as numerical feature
 df['num_authors'] = df['authors.name'].apply(lambda x: len(ast.literal_eval(x)) if pd.notna(x) and x != '[]' else 1)
 X_authors = scaler.fit_transform(df[['num_authors']])
 
+# Combine all static features into one matrix
 X_static = np.hstack((X_text, X_numerical, X_fos, X_authors))
 print(f"Final static feature matrix shape: {X_static.shape}")
 
 # --------------------------
 # 4. Graph Matrices & Tensor Setup
 # --------------------------
+# Map between node IDs and integer indices
 idx_to_id = {i: node_id for i, node_id in enumerate(G.nodes())}
 id_to_idx = {node_id: i for i, node_id in enumerate(G.nodes())}
 
+# Convert edges to index-based representation for adjacency matrix
 edges = [(id_to_idx[u], id_to_idx[v]) for u, v in G.edges()]
 N = G.number_of_nodes()
 rows = [u for u, v in edges]
 cols = [v for u, v in edges]
 data = np.ones(len(edges))
 
+# Create sparse adjacency matrix
 adj_matrix = sp.coo_matrix((data, (rows, cols)), shape=(N, N), dtype=np.float32)
 adj_matrix_sliceable = adj_matrix.tocsr()
 
+# Symmetric normalization of adjacency matrix
 def normalize_adj_sym(adj):
+    # Make adjacency symmetric
     adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
     adj_hat = adj + sp.eye(adj.shape[0])
     rowsum = np.array(adj_hat.sum(1))
@@ -92,6 +108,7 @@ def normalize_adj_sym(adj):
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     return adj_hat.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
 
+# Convert sparse matrix to PyTorch sparse tensor
 def sparse_to_torch_sparse(sparse_mx):
     sparse_mx = sparse_mx.tocoo().astype(np.float32)
     indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
@@ -99,6 +116,7 @@ def sparse_to_torch_sparse(sparse_mx):
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse_coo_tensor(indices, values, shape)
 
+# Convert static features to torch tensor
 X_tensor = torch.FloatTensor(X_static)
 
 # --------------------------
@@ -110,6 +128,7 @@ min_year = years.min()
 max_year = years.max()
 time_steps = list(range(min_year, max_year + DELTA_T, DELTA_T))
 
+# Split nodes into temporal segments
 temporal_segments = {}
 for i in range(len(time_steps)-1):
     t_start = time_steps[i]
@@ -125,6 +144,12 @@ print(f"Total segments created: {len(temporal_segments)}")
 # --------------------------
 def train_unsupervised_with_prior(model, X_features, adj_indices, prev_embeddings=None,
                                   epochs=100, lr=0.01, device='cpu', temporal_weight=0.5):
+    """
+    Train LLGC model in unsupervised manner with optional temporal regularization.
+    - X_features: node features
+    - adj_indices: adjacency indices for reconstruction loss
+    - prev_embeddings: embeddings from previous time step (optional)
+    """
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     X_features = X_features.to(device)
@@ -133,7 +158,7 @@ def train_unsupervised_with_prior(model, X_features, adj_indices, prev_embedding
         optimizer.zero_grad()
         Z = model(X_features)
         row, col = adj_indices
-        loss = (Z[row] - Z[col]).pow(2).sum(dim=1).mean()
+        loss = (Z[row] - Z[col]).pow(2).sum(dim=1).mean()  # adjacency reconstruction loss
         if prev_embeddings is not None:
             prev_embeddings = prev_embeddings.to(device)
             common_nodes = min(Z.size(0), prev_embeddings.size(0))
@@ -144,6 +169,10 @@ def train_unsupervised_with_prior(model, X_features, adj_indices, prev_embedding
     return model
 
 def run_anomaly_detection(embeddings, contamination_rate):
+    """
+    Run IsolationForest to detect anomalies on embeddings.
+    Returns anomaly scores and predicted labels (-1 for anomaly, 1 for normal)
+    """
     clf = IsolationForest(contamination=contamination_rate, random_state=42)
     clf.fit(embeddings)
     anomalies = clf.predict(embeddings)
@@ -152,11 +181,11 @@ def run_anomaly_detection(embeddings, contamination_rate):
 
 import copy
 
-def inject_synthetic_nodes(df, percent_new=0.05, connection_percent=0.30, id_prefix="FAKE_"):
+def inject_synthetic_nodes(df, percent_new=0.05, min_connections=2, max_connections=7, id_prefix="FAKE_"):
     """
     Inject synthetic rows into the dataframe.
     - percent_new: proportion of new nodes to add (default 5%).
-    - connection_percent: proportion of real nodes each fake node connects to (default 30%).
+    - min_connections, max_connections: each fake node connects to a random number of real nodes between these values.
     Returns new dataframe with an 'is_synthetic' boolean column and list-valued 'references'.
     """
     df = df.copy()  # avoid mutating caller's object unexpectedly
@@ -196,12 +225,11 @@ def inject_synthetic_nodes(df, percent_new=0.05, connection_percent=0.30, id_pre
 
     # ---- Build connections ----
     all_real_ids = df["id"].tolist()
-    connections_per_fake = max(1, int(num_original * connection_percent))
-    print(f"[Injection] Each fake node will reference {connections_per_fake} real nodes.")
+    print(f"[Injection] Each fake node will reference between {min_connections} and {max_connections} real nodes.")
 
     for fake_row in fake_rows:
-        sampled_ids = random.sample(all_real_ids, connections_per_fake)
-        # store as list (not string)
+        num_connections = random.randint(min_connections, max_connections)
+        sampled_ids = random.sample(all_real_ids, min(num_connections, len(all_real_ids)))
         fake_row['references'] = sampled_ids
 
     df_fake = pd.DataFrame(fake_rows)
@@ -211,8 +239,6 @@ def inject_synthetic_nodes(df, percent_new=0.05, connection_percent=0.30, id_pre
 
     print("[Injection] Synthetic nodes successfully added.")
     return df_final
-
-
 
 # --------------------------
 # 7. Parameters & Setup
@@ -246,24 +272,30 @@ for (t_start, t_end), global_indices in temporal_segments.items():
     global_indices_np = np.array(global_indices)
     adj_segment = adj_matrix_sliceable[global_indices_np[:, None], global_indices_np]
 
+    # Normalize adjacency and convert to torch sparse tensor
     adj_norm_real = normalize_adj_sym(adj_segment)
     adj_tensor_real = sparse_to_torch_sparse(adj_norm_real).to(DEVICE)
     
+    # Apply PageRank-based aggregation (SGConv)
     sgconv = PageRankAgg(K=K_PROP, alpha=ALPHA, add_self_loops=False).to(DEVICE)
     X_gconv_real, _ = sgconv(X_t, adj_tensor_real._indices(), adj_tensor_real._values())
     
+    # Train LLGC model with optional temporal prior
     model_real = LLGC(X_gconv_real.size(1), EMBEDDING_DIM, DROP_OUT, USE_BIAS).to(DEVICE)
     model_real = train_unsupervised_with_prior(
         model_real, X_gconv_real, adj_tensor_real._indices(), 
         prev_embeddings=prev_Z_t, epochs=EPOCHS, lr=LR, device=DEVICE
     )
     
+    # Evaluate embeddings and store for next time step
     model_real.eval()
     Z_t_real = model_real(X_gconv_real).cpu().detach()
     prev_Z_t = Z_t_real.clone()
     
+    # Run anomaly detection
     scores_real, pred_real = run_anomaly_detection(Z_t_real.numpy(), contamination_rate=0.01)
     
+    # Save results
     for idx, paper_idx in enumerate(global_indices):
         all_results_rows.append({
             'paper_id': idx_to_id[paper_idx],
@@ -273,16 +305,15 @@ for (t_start, t_end), global_indices in temporal_segments.items():
         })
 
     print(f"Segment [{t_start}-{t_end}] completed (Real Only)")
-"""
+
 # ---------------------------------------------------------
 # 9. Inject NEW Synthetic Nodes (Feature + Edge Injection)
 # ---------------------------------------------------------
 print("\n" + "="*70)
-print("Injecting Synthetic Nodes (5% new, 30% connections)")
+print("Injecting Synthetic Nodes (5% new, 2-7 random connections each)")
 print("="*70)
 
-df = inject_synthetic_nodes(df, percent_new=0.02, connection_percent=0.0 5)
-
+df = inject_synthetic_nodes(df, percent_new=0.05, min_connections=2, max_connections=7)
 print(f"New dataframe size after injection: {len(df)} rows")
 
 # ---------------------------------------------------------
@@ -292,34 +323,23 @@ print("\n" + "="*70)
 print("Running Detection on Injected Synthetic Nodes")
 print("="*70)
 
-# Rebuild adjacency matrix & features from updated df
-
 # Map paper_id → new index
 new_idx_map = {pid: i for i, pid in enumerate(df['id'])}
 N = len(df)
 
-# Build feature matrix (TF-IDF or whatever X_tensor source you used)
-# IMPORTANT: rebuild from the updated df
+# Build new feature matrix (TF-IDF only here for simplicity)
 texts = df['abstract'].fillna("").astype(str).tolist()
 vectorizer = TfidfVectorizer(max_features=X_tensor.shape[1])
 X_full_new = torch.tensor(vectorizer.fit_transform(texts).todense(), dtype=torch.float32).to(DEVICE)
 
-# Build adjacency from references
-rows = []
-cols = []
-
+# Build adjacency from references (bi-directional)
+rows, cols = [], []
 for i, refs in enumerate(df['references']):
-    if isinstance(refs, str) and refs.startswith("["):
-        try:
-            parsed = eval(refs)
-            for ref in parsed:
-                if ref in new_idx_map:
-                    rows.append(i)
-                    cols.append(new_idx_map[ref])
-                    rows.append(new_idx_map[ref])
-                    cols.append(i)
-        except:
-            pass
+    if isinstance(refs, list):
+        for ref in refs:
+            if ref in new_idx_map:
+                rows += [i, new_idx_map[ref]]
+                cols += [new_idx_map[ref], i]
 
 adj_new = sp.coo_matrix((np.ones(len(rows)), (rows, cols)),
                         shape=(N, N), dtype=np.float32)
@@ -344,6 +364,7 @@ model_new = train_unsupervised_with_prior(
     device=DEVICE
 )
 
+# Compute embeddings
 model_new.eval()
 Z_new = model_new(X_gconv_new).cpu().detach().numpy()
 
@@ -351,11 +372,11 @@ Z_new = model_new(X_gconv_new).cpu().detach().numpy()
 fake_mask = df['is_synthetic'].astype(bool).values
 fake_indices = np.where(fake_mask)[0]
 
-# Run anomaly detection with realistic contamination
+# Run anomaly detection
 contamination = max(0.01, len(fake_indices) / len(df))
 scores_new, pred_new = run_anomaly_detection(Z_new, contamination_rate=contamination)
 
-# Save results ONLY for injected fakes
+# Save results for synthetic nodes
 detected_count = 0
 for idx in fake_indices:
     if pred_new[idx] == -1:
@@ -372,13 +393,10 @@ for idx in fake_indices:
 
 print(f"\n🔥 Injected Fake Detection Results: {detected_count}/{len(fake_indices)} "
       f"({detected_count/len(fake_indices):.1%})")
-"""
-
 
 # --------------------------
-# 10. Save Results
+# 11. Save Results
 # --------------------------
 out_df = pd.DataFrame(all_results_rows)
 out_df.to_csv("temporal_anomaly_results_real_only.csv", index=False)
-
 print("\n✅ CSV saved: temporal_anomaly_results_real_only.csv")
