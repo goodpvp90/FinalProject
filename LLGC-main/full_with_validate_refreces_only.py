@@ -297,6 +297,7 @@ print("\n" + "="*70)
 print("Cleaning real anomalies before injection")
 print("="*70)
 
+
 results_df = pd.DataFrame(all_results_rows)
 
 # Only real nodes
