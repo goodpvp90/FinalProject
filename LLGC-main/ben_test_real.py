@@ -1,112 +1,111 @@
+import argparse
 import pandas as pd
 import numpy as np
 import torch
 import networkx as nx
-import re
+import ast
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import recall_score, precision_score, f1_score
 
-# ייבוא רכיבים מתוך ה-repo
+# ייבוא הרכיבים מהקבצים הקיימים ב-repo
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
-# --- הפונקציה המתוקנת ---
-def build_adjacency_matrix(df):
-    print("--- Building graph structure (Fixed Isolated Nodes) ---")
-    node_to_idx = {node_id: i for i, node_id in enumerate(df['id'])}
-    edges = []
-    
-    for i, row in df.iterrows():
-        source_idx = node_to_idx[row['id']]
-        for target_id in row['references']:
-            if target_id in node_to_idx:
-                edges.append((source_idx, node_to_idx[target_id]))
-    
-    # יצירת גרף ריק והוספת כל הצמתים מראש
-    G = nx.Graph()
-    G.add_nodes_from(range(len(df))) # מבטיח שכל הצמתים מ-0 עד N-1 קיימים בגרף
-    G.add_edges_from(edges)
-    
-    # כעת הפונקציה תעבוד ללא שגיאה כי כל רשימת ה-nodelist קיימת ב-G
-    adj = nx.adjacency_matrix(G, nodelist=range(len(df)))
-    
-    # נרמול המטריצה כפי שמוגדר ב-utils.py
-    adj_normalized, _ = preprocess_citation(adj, np.zeros((len(df), 1)), normalization="AugNormAdj")
-    return sparse_mx_to_torch_sparse_tensor(adj_normalized)
+parser = argparse.ArgumentParser()
+parser.add_argument('--embedding_dim', type=int, default=64)
+parser.add_argument('--K', type=int, default=10)
+parser.add_argument('--alpha', type=float, default=0.15, help='Lower alpha for more smoothing')
+parser.add_argument('--seed', type=int, default=42)
+args = parser.parse_args()
 
-# --- שאר הלוגיקה לשיפור הדיוק ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def extract_features(df):
-    print("--- Extracting features (Semantic + Structural) ---")
-    df['text_combined'] = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=1500)
-    X_text = vectorizer.fit_transform(df['text_combined']).toarray()
+def load_and_inject_anomalies():
+    print("Loading data...")
+    # טעינת המאמרים האמיתיים והמזויפים
+    df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
+    df_fakes = pd.read_csv("fakes.csv")
     
-    scaler = StandardScaler()
-    # הוספת num_refs כפיצ'ר קריטי לזיהוי אנומליות מבניות
-    X_num = scaler.fit_transform(df[['year', 'n_citation', 'num_refs']].fillna(0))
+    df_real['is_anomaly'] = 0
+    df_fakes['is_anomaly'] = 1
     
-    # תמיכה בגרסאות שונות של sklearn
-    try:
-        encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-    except TypeError:
-        encoder = OneHotEncoder(handle_unknown='ignore', sparse=False)
-    X_fos = encoder.fit_transform(df[['fos.name']].fillna('Unknown'))
-    
-    return torch.FloatTensor(np.hstack((X_text, X_num, X_fos)))
-
-def run_anomaly_detection():
-    # קבצי המקור ב-repo
-    real_file = "final_filtered_by_fos_and_reference.csv"
-    fakes_file = "fakes.csv"
-    
-    # 1. הכנת נתונים (עם פונקציית safe_parse_list מהשלב הקודם)
-    def safe_parse_list(val):
-        if pd.isna(val) or val == "" or val == "[]": return []
-        return re.findall(r'[a-zA-Z0-9]+', str(val))
-
-    df_real = pd.read_csv(real_file)
-    df_fakes = pd.read_csv(fakes_file)
-    df_real['is_anomaly'], df_fakes['is_anomaly'] = 0, 1
     df = pd.concat([df_real, df_fakes], ignore_index=True)
     df['id'] = df['id'].astype(str)
-    df['references'] = df['references'].apply(safe_parse_list)
-    df['num_refs'] = df['references'].apply(len)
+    node_ids = df['id'].tolist()
+    node_to_idx = {node_id: i for i, node_id in enumerate(node_ids)}
     
-    features = extract_features(df)
-    adj = build_adjacency_matrix(df)
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    features, adj = features.to(device), adj.to(device)
+    # 1. בניית הגרף (זיהוי קשרים)
+    G = nx.Graph()
+    G.add_nodes_from(node_ids)
+    for _, row in df.iterrows():
+        try:
+            refs = ast.literal_eval(row['references'])
+            for ref in refs:
+                if str(ref) in node_to_idx:
+                    G.add_edge(row['id'], str(ref))
+        except: continue
 
-    # 2. שימוש במודל ה-LLGC להטמעה היפרבולית
-    # הגברת K ל-30 כדי להבליט את הבידוד המבני של ה-Fakes
-    aggregator = PageRankAgg(K=30, alpha=0.1).to(device)
-    x_agg, _ = aggregator(features, adj._indices())
+    # 2. הפקת פיצ'רים טקסטואליים (TF-IDF)
+    # אנחנו לא דוחפים ערכים מוגזמים, אלא נותנים ל-TF-IDF לעשות את שלו
+    df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
+    vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
+    tfidf_matrix = vectorizer.fit_transform(df['text']).toarray()
     
-    model = LLGC(nfeat=features.shape[1], nclass=128, drop_out=0.0, use_bias=1).to(device)
+    # 3. הוספת פיצ'ר מבני: דרגת הצומת (Degree) - קריטי לזיהוי אנומליה ללא רעש
+    # צמתים מזויפים הם לרוב מבודדים בגרף הציטוטים
+    degrees = np.array([G.degree(n) for n in node_ids]).reshape(-1, 1)
+    # נרמול הדרגה כדי שתהיה בטווח של הפיצ'רים האחרים (0 עד 1)
+    if degrees.max() > 0:
+        degrees = degrees / degrees.max()
+    
+    # שילוב הדרגה עם ה-TF-IDF
+    combined_features = np.hstack([tfidf_matrix, degrees])
+    
+    features_tensor = torch.FloatTensor(combined_features).to(device)
+    
+    # הכנת מטריצת שכנות לנרמול (AugNormAdj)
+    adj = nx.adjacency_matrix(G, nodelist=node_ids)
+    adj, _ = preprocess_citation(adj, combined_features, normalization="AugNormAdj")
+    adj_tensor = sparse_mx_to_torch_sparse_tensor(adj).to(device)
+    
+    return features_tensor, adj_tensor, df, len(df_fakes)
+
+def main():
+    features, adj, df, num_injected = load_and_inject_anomalies()
+    
+    # 4. PageRank Smoothing (Aggregation)
+    # צמתים רגילים "יתערבבו" עם השכנים שלהם ויהפכו לממוצע הקבוצה.
+    # צמתים מבודדים (אנומליות) יישארו עם הפיצ'רים המקוריים שלהם, מה שיבליט אותם.
+    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
+    x_smooth, _ = aggregator(features, adj._indices())
+    
+    # 5. Lorentzian Embedding (LLGC)
+    # המודל משליך את הנתונים למרחב היפרבולי, שטוב במיוחד לזיהוי היררכיות וחריגות.
+    model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, 
+                  drop_out=0.0, use_bias=True).to(device)
     model.eval()
-    with torch.no_grad():
-        embeddings = model(x_agg).cpu().numpy()
-
-    # 3. זיהוי אנומליות - Isolation Forest על שילוב של מבנה ותוכן
-    contamination = len(df[df['is_anomaly'] == 1]) / len(df)
-    combined_input = np.hstack((embeddings, features.cpu().numpy()))
     
-    clf = IsolationForest(n_estimators=500, contamination=contamination, random_state=42)
-    df['prediction'] = [1 if p == -1 else 0 for p in clf.fit_predict(combined_input)]
-
-    # 4. תוצאות
-    recall = recall_score(df['is_anomaly'], df['prediction'])
-    print("\n" + "═"*40)
-    print(f"Recall (Fake Detection): {recall:.2%}")
-    print(f"Precision: {precision_score(df['is_anomaly'], df['prediction']):.2%}")
-    print("═"*40)
-
-    if recall >= 0.85:
-        print("✅ Target Reached! The model effectively identifies injected fakes.")
+    with torch.no_grad():
+        # ההטמעה (Embedding) תדגיש את המרחק של האנומליות מהמרכז
+        embeddings = model(x_smooth).cpu().numpy()
+        
+    # 6. Isolation Forest - זיהוי ה-Outliers במרחב ההטמעה
+    clf = IsolationForest(contamination='auto', random_state=args.seed)
+    clf.fit(embeddings)
+    df['anomaly_score'] = -clf.decision_function(embeddings)
+    
+    # הערכת ביצועים
+    df_sorted = df.sort_values(by='anomaly_score', ascending=False)
+    top_detected = df_sorted.head(num_injected)['is_anomaly'].sum()
+    
+    print(f"\n--- Detection Results (Without Noise Injection) ---")
+    print(f"Precision@{num_injected}: {top_detected / num_injected:.4f}")
+    print(f"Detected {top_detected} out of {num_injected} injected fakes.")
+    
+    print("\nTop 10 Anomaly Candidates Found:")
+    for i, (idx, row) in enumerate(df_sorted.head(10).iterrows()):
+        label = "[FAKE]" if row['is_anomaly'] == 1 else "[REAL]"
+        print(f"#{i+1} {label} Score: {row['anomaly_score']:.4f} | Degree: {row['references']} | Title: {row['title'][:50]}...")
 
 if __name__ == "__main__":
-    run_anomaly_detection()
+    main()
