@@ -1,114 +1,134 @@
+import argparse
 import pandas as pd
-import networkx as nx
 import numpy as np
 import torch
-from torch_geometric.nn.conv import MessagePassing
-from torch_sparse import SparseTensor, matmul
-import scipy.sparse as sp
+import networkx as nx
+import ast
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
+from time import perf_counter
 
-# --------------------------
-# 0. Load dataset
-# --------------------------
-DATA_FILE = "final_filtered_by_fos_and_reference.csv"
-print(f"Loading dataset: {DATA_FILE}")
-df = pd.read_csv(DATA_FILE)
+# ייבוא הרכיבים מהקוד המקורי
+from model import LLGC, PageRankAgg
+from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
-# ensure 'references' column is a list
-def parse_references(x):
-    if isinstance(x, str):
-        # remove quotes if they exist
-        x_clean = x.strip().replace("'", '"')
+# הגדרת פרמטרים (בדומה ל-run_cora.py)
+parser = argparse.ArgumentParser()
+parser.add_argument('--embedding_dim', type=int, default=64, help='Dimension of Lorentzian embeddings.')
+parser.add_argument('--K', type=int, default=10, help='Number of propagation steps.')
+parser.add_argument('--alpha', type=float, default=0.15, help='Alpha for PageRank.')
+parser.add_argument('--no-cuda', action='store_true', default=False, help='Disables CUDA training.')
+parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+parser.add_argument('--trials', type=int, default=5, help='Number of trials.')
+
+args = parser.parse_args()
+args.cuda = not args.no_cuda and torch.cuda.is_available()
+device = "cuda" if args.cuda else "cpu"
+
+def load_custom_data():
+    """
+    טעינת הדאטאסט המקורי והזרקת האנומליות מקובץ fakes.csv
+    """
+    # 1. טעינת הקבצים
+    df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
+    df_fakes = pd.read_csv("fakes.csv")
+    
+    # סימון מי אנומליה (Ground Truth)
+    df_real['is_anomaly'] = 0
+    df_fakes['is_anomaly'] = 1
+    
+    # איחוד דאטאסטים
+    df = pd.concat([df_real, df_fakes], ignore_index=True)
+    df['id'] = df['id'].astype(str)
+    
+    print(f"Loaded {len(df_real)} real papers and {len(df_fakes)} fake papers.")
+    
+    # 2. בניית הגרף (מבוסס על עמודת ה-references)
+    G = nx.Graph()
+    node_ids = df['id'].tolist()
+    node_to_idx = {node_id: i for i, node_id in enumerate(node_ids)}
+    G.add_nodes_from(node_ids)
+    
+    for _, row in df.iterrows():
         try:
-            return list(eval(x_clean))
+            # המרת מחרוזת הרשימה לרשימה אמיתית
+            refs = ast.literal_eval(row['references'])
+            for ref in refs:
+                ref_str = str(ref)
+                if ref_str in node_to_idx:
+                    G.add_edge(row['id'], ref_str)
         except:
-            return []
-    elif isinstance(x, list):
-        return x
-    else:
-        return []
-df['references'] = df['references'].apply(parse_references)
+            continue
+            
+    # 3. הפקת פיצ'רים (TF-IDF על כותרת ותקציר)
+    df['combined_text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
+    vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
+    tfidf_features = vectorizer.fit_transform(df['combined_text']).toarray()
+    features = torch.FloatTensor(tfidf_features).to(device)
+    
+    # 4. הכנת מטריצת שכנות עבור הפרופגציה
+    adj = nx.adjacency_matrix(G, nodelist=node_ids)
+    # שימוש בפונקציות העזר מ-utils לעיבוד המטריצה
+    adj, _ = preprocess_citation(adj, tfidf_features, normalization="AugNormAdj")
+    adj_tensor = sparse_mx_to_torch_sparse_tensor(adj).to(device)
+    
+    return features, adj_tensor, df, len(df_fakes)
 
-# --------------------------
-# 1. Build Graph
-# --------------------------
-G = nx.DiGraph()
-paper_ids = set(df['id'])
-for _, row in df.iterrows():
-    G.add_node(row['id'])
+def main():
+    # טעינה והזרקה
+    features, adj, df, num_injected = load_custom_data()
+    
+    # שלב 1: PageRank Smoothing (בדומה ל-run_cora)
+    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
+    # PageRankAgg מצפה ל-indices בגרסת ה-forward שלו
+    x_smooth, _ = aggregator(features, adj._indices())
+    
+    # שלב 2: הפקת Embeddings לורנציאניים (LLGC)
+    # אנחנו משתמשים במודל כ-Feature Extractor למרחב היפרבולי
+    model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, 
+                 drop_out=0.0, use_bias=True).to(device)
+    model.eval()
+    
+    with torch.no_grad():
+        # המודל מחזיר את הייצוג ב-Tangent Space של מרחב לורנץ
+        embeddings = model(x_smooth).cpu().numpy()
+        
+    # שלב 3: זיהוי אנומליות באמצעות Isolation Forest
+    print("Running Isolation Forest on embeddings...")
+    clf = IsolationForest(contamination='auto', random_state=args.seed)
+    # ציון אנומליה (נמוך יותר = אנומלי יותר, לכן נהפוך סימן)
+    anomaly_scores = -clf.decision_function(embeddings)
+    df['anomaly_score'] = anomaly_scores
+    
+    # שלב 4: הערכת ביצועים
+    # נמיין לפי הציון הגבוה ביותר (הכי אנומלי)
+    df_sorted = df.sort_values(by='anomaly_score', ascending=False)
+    
+    # נבדוק כמה מהמוזרקים נמצאים ב-Top N (כאשר N הוא מספר המוזרקים)
+    top_candidates = df_sorted.head(num_injected)
+    detected_injected = top_candidates['is_anomaly'].sum()
+    
+    precision_at_k = detected_injected / num_injected
+    
+    print("\n" + "="*30)
+    print(f"Results for this run:")
+    print(f"Total injected fakes: {num_injected}")
+    print(f"Fakes detected in Top {num_injected}: {detected_injected}")
+    print(f"Precision@{num_injected}: {precision_at_k:.4f}")
+    
+    # הצגת דוגמאות
+    print("\nTop 5 Most Anomalous Papers Found:")
+    for i, row in df_sorted.head(5).iterrows():
+        label = "[FAKE]" if row['is_anomaly'] == 1 else "[REAL]"
+        print(f"{label} Score: {row['anomaly_score']:.4f} | ID: {row['id']} | Title: {row['title'][:60]}...")
+        
+    return precision_at_k
 
-for _, row in df.iterrows():
-    for ref in row['references']:
-        if ref in paper_ids:
-            G.add_edge(row['id'], ref)
-
-print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-
-# --------------------------
-# 2. Initial Features (degree only)
-# --------------------------
-deg_in = np.array([G.in_degree(n) for n in G.nodes()], dtype=np.float32)
-deg_out = np.array([G.out_degree(n) for n in G.nodes()], dtype=np.float32)
-X = np.stack([deg_in, deg_out], axis=1)
-X_tensor = torch.FloatTensor(X)
-
-# --------------------------
-# 3. Sparse adjacency
-# --------------------------
-edges = list(G.edges())
-rows = [list(G.nodes()).index(u) for u, v in edges]
-cols = [list(G.nodes()).index(v) for u, v in edges]
-data = np.ones(len(edges))
-adj = sp.coo_matrix((data, (rows, cols)), shape=(len(G), len(G)), dtype=np.float32)
-
-def sparse_to_torch_sparse(sparse_mx):
-    sparse_mx = sparse_mx.tocoo()
-    indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
-    values = torch.from_numpy(sparse_mx.data)
-    shape = torch.Size(sparse_mx.shape)
-    return torch.sparse_coo_tensor(indices, values, shape)
-
-adj_tensor = sparse_to_torch_sparse(adj)
-
-# --------------------------
-# 4. PageRank-based aggregator
-# --------------------------
-class PageRankAgg(MessagePassing):
-    def __init__(self, K=5, alpha=0.1):
-        super().__init__(aggr='add')
-        self.K = K
-        self.alpha = alpha
-
-    def forward(self, x, edge_index, edge_weight=None):
-        h = x
-        for _ in range(self.K):
-            x = self.propagate(edge_index, x=x, edge_weight=edge_weight)
-            x = x * (1 - self.alpha) + self.alpha * h
-        return x
-
-    def message(self, x_j, edge_weight):
-        if edge_weight is None:
-            return x_j
-        return x_j * edge_weight.view(-1, 1)
-
-agg = PageRankAgg(K=5, alpha=0.1)
-embeddings = agg(X_tensor, adj_tensor._indices(), adj_tensor._values())
-
-# --------------------------
-# 5. Anomaly detection
-# --------------------------
-clf = IsolationForest(contamination=0.01, random_state=42)
-clf.fit(embeddings.detach().numpy())
-pred = clf.predict(embeddings.detach().numpy())  # -1 = anomaly, 1 = normal
-num_anomalies = (pred == -1).sum()
-print(f"Detected anomalies: {num_anomalies}/{len(G)} ({num_anomalies/len(G):.2%})")
-
-# --------------------------
-# 6. Save results
-# --------------------------
-results_df = pd.DataFrame({
-    'paper_id': list(G.nodes()),
-    'anomaly_prediction': pred
-})
-results_df.to_csv("llgc_graph_only_anomaly_results.csv", index=False)
-print("✅ Results saved to llgc_graph_only_anomaly_results.csv")
+if __name__ == "__main__":
+    results = []
+    for t in range(args.trials):
+        print(f"\n--- Trial {t+1}/{args.trials} ---")
+        results.append(main())
+    
+    print("\n" + "="*30)
+    print(f"Final Average Precision across {args.trials} trials: {np.mean(results):.5f}")
