@@ -43,27 +43,35 @@ def load_and_inject_anomalies():
                     G.add_edge(row['id'], str(ref))
         except: continue
 
-    # 1. שיפור ה-TF-IDF: נגדיל את כמות המילים ונשתמש ב-N-grams
-    # זה קריטי כדי שהמילים של ה-fakes ייכללו בוקטור
+    # א. TF-IDF משופר: רגישות גבוהה למילים נדירות
     df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
     vectorizer = TfidfVectorizer(
-        max_features=2000, # הגדלה משמעותית
+        max_features=1500, 
         stop_words='english',
-        ngram_range=(1, 2) # זיהוי ביטויים
+        min_df=1,          # אל תזרוק מילים שמופיעות רק ב-fakes
+        use_idf=True, 
+        smooth_idf=True
     )
     tfidf_matrix = vectorizer.fit_transform(df['text']).toarray()
     
-    # 2. נרמול לוגריתמי של הדרגה (Degree)
-    # זה מונע ממאמרים עם המון ציטוטים להשתלט על הניקוד
+    # ב. הוספת תכונת "צפיפות סמנטית" 
+    # מאמרים מזויפים על נושאים זרים יקבלו ערכים נמוכים מאוד במילים הנפוצות של CS
+    semantic_density = np.sum(tfidf_matrix, axis=1).reshape(-1, 1)
+    
+    # ג. נרמול לוגריתמי של הדרגה
     degrees = np.array([G.degree(n) for n in node_ids]).reshape(-1, 1)
-    log_degrees = np.log1p(degrees) 
+    log_degrees = np.log1p(degrees)
     if log_degrees.max() > 0:
         log_degrees = log_degrees / log_degrees.max()
     
-    # 3. שקלול: ניתן יותר משקל לטקסט מאשר למבנה
-    # כדי שהתוכן הזר ("baking") ינצח את העובדה שהמאמר מבודד
-    combined_features = np.hstack([tfidf_matrix * 2.0, log_degrees])
+    # שילוב התכונות: טקסט (דומיננטי) + מבנה + צפיפות
+    combined_features = np.hstack([tfidf_matrix, log_degrees, semantic_density])
     
+    # נרמול סופי כדי שכל שורה תהיה באותה סקאלה (חשוב ל-LLGC)
+    row_norms = np.linalg.norm(combined_features, axis=1, keepdims=True)
+    row_norms[row_norms == 0] = 1.0
+    combined_features = combined_features / row_norms
+
     features_tensor = torch.FloatTensor(combined_features).to(device)
     
     adj = nx.adjacency_matrix(G, nodelist=node_ids)
@@ -81,7 +89,7 @@ def main():
     # 4. PageRank Smoothing (Aggregation)
     # צמתים רגילים "יתערבבו" עם השכנים שלהם ויהפכו לממוצע הקבוצה.
     # צמתים מבודדים (אנומליות) יישארו עם הפיצ'רים המקוריים שלהם, מה שיבליט אותם.
-    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
+    aggregator = PageRankAgg(K=args.K, alpha=0.8).to(device)
     x_smooth, _ = aggregator(features, adj._indices())
     
     # 5. Lorentzian Embedding (LLGC)
