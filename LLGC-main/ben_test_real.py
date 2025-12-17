@@ -1,81 +1,127 @@
-import torch
-import torch.nn.functional as F
-import numpy as np
+import argparse
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from model import LLGC, PageRankAgg
-from manifolds.lorentzian import Lorentzian
-import ast
+import numpy as np
+import torch
 import networkx as nx
+import ast
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import recall_score, precision_score, f1_score
 
-# ... (prepare_data_and_labels נשאר זהה לקוד הקודם שלך) ...
+# ייבוא רכיבים מתוך ה-repo הקיים
+from model import LLGC, PageRankAgg
+from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
-def main():
-    features, edge_index, df, idx_train, labels, num_classes = prepare_data_and_labels()
+def load_and_prepare_data(real_path, fakes_path):
+    print(f"--- Loading datasets: {real_path} and {fakes_path} ---")
+    df_real = pd.read_csv(real_path)
+    df_fakes = pd.read_csv(fakes_path)
     
-    # אתחול המודל (256D)
-    model = LLGC(nfeat=features.size(1), nclass=256, drop_out=0.1, use_bias=True).to(device)
-    cls_head = torch.nn.Linear(256, num_classes).to(device)
-    aggregator = PageRankAgg(K=10, alpha=0.15).to(device)
-    optimizer = torch.optim.Adam(list(model.parameters()) + list(cls_head.parameters()), lr=0.01)
-    manifold = Lorentzian()
+    # סימון לייבלים לולידציה בלבד (0 - תקין, 1 - אנומליה)
+    df_real['is_anomaly'] = 0
+    df_fakes['is_anomaly'] = 1
+    
+    # איחוד הנתונים
+    df = pd.concat([df_real, df_fakes], ignore_index=True)
+    df['id'] = df['id'].astype(str)
+    
+    # עיבוד עמודת ה-references (הפיכה מרשימת טקסט לרשימה פייתונית)
+    df['references'] = df['references'].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else [])
+    
+    return df
 
-    # שלב 1: אימון מהיר כדי לייצב את המרחב
-    print("--- Training 256D Base Space ---")
-    model.train()
-    for epoch in range(101):
-        optimizer.zero_grad()
-        # אימון על הזרם המוחלק (כדי ללמוד קהילות)
-        x_smooth, _ = aggregator(features, edge_index)
-        embeddings = model(x_smooth)
-        logits = cls_head(embeddings[idx_train])
-        loss = F.cross_entropy(logits, labels)
-        loss.backward()
-        optimizer.step()
-        if epoch % 50 == 0: print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+def extract_features(df):
+    print("--- Extracting features (Text + Metadata) ---")
+    # 1. טקסט: כותרת + תקציר
+    df['text_combined'] = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+    X_text = vectorizer.fit_transform(df['text_combined']).toarray()
+    
+    # 2. נומרי: שנה וכמות ציטוטים
+    scaler = StandardScaler()
+    X_num = scaler.fit_transform(df[['year', 'n_citation']].fillna(0))
+    
+    # 3. קטגורי: Field of Study
+    encoder = OneHotEncoder(handle_unknown='ignore', sparse=False)
+    X_fos = encoder.fit_transform(df[['fos.name']].fillna('Unknown'))
+    
+    # שילוב הכל למטריצת פיצ'רים אחת
+    X_static = np.hstack((X_text, X_num, X_fos))
+    return torch.FloatTensor(X_static)
 
-    # שלב 2: זיהוי לפי Residual Distance (מרחק לורנציאני בין המקור להקשר)
-    print("\n--- Calculating Lorentzian Residuals (The Deep Way) ---")
-    model.eval()
+def build_adjacency_matrix(df):
+    print("--- Building graph structure ---")
+    node_to_idx = {node_id: i for i, node_id in enumerate(df['id'])}
+    edges = []
+    
+    for i, row in df.iterrows():
+        source_idx = node_to_idx[row['id']]
+        for target_id in row['references']:
+            if target_id in node_to_idx:
+                edges.append((source_idx, node_to_idx[target_id]))
+    
+    # בניית מטריצת שכנות דלילה (Sparse Matrix)
+    adj = nx.adjacency_matrix(nx.Graph(edges), nodelist=range(len(df)))
+    # נרמול המטריצה כפי שנעשה ב-Cora
+    adj_normalized, _ = preprocess_citation(adj, np.zeros((len(df), 1)))
+    return sparse_mx_to_torch_sparse_tensor(adj_normalized)
+
+def run_anomaly_detection():
+    # פרמטרים
+    real_file = "final_filtered_by_fos_and_reference.csv"
+    fakes_file = "fakes.csv"
+    
+    # 1. טעינת נתונים
+    df = load_and_prepare_data(real_file, fakes_file)
+    features = extract_features(df)
+    adj = build_adjacency_matrix(df)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    features = features.to(device)
+    adj = adj.to(device)
+
+    # 2. הרצת GNN (LLGC Logic) להפקת Embeddings מבניים
+    print("--- Computing Hyperbolic Embeddings (LLGC) ---")
+    # שימוש ב-PageRankAgg מה-repo לצבירת מידע מהשכנים
+    aggregator = PageRankAgg(K=10, alpha=0.1).to(device)
+    x_agg, _ = aggregator(features, adj._indices())
+    
+    # שימוש במודל ה-LLGC להטמעה במרחב Lorentzian
+    # נגדיר ממד פלט של 64 עבור ה-embeddings
+    model = LLGC(nfeat=features.shape[1], nclass=64, drop_out=0.0, use_bias=1).to(device)
     with torch.no_grad():
-        # א. ייצוג מקומי (רק התוכן של המאמר)
-        z_local = model(features) 
-        
-        # ב. ייצוג הקשרי (מה שהשכנים אומרים)
-        x_smooth, _ = aggregator(features, edge_index)
-        z_context = model(x_smooth)
-        
-        # ג. חישוב המרחק הלורנציאני בין השניים
-        # במאמר תקין, התוכן תואם את השכנים (מרחק קטן)
-        # באנומליה (כמו Cooking בתוך Computer Science), יש סתירה (מרחק גדול)
-        residual_dist = manifold.induced_distance(z_local, z_context, model.c)
-        residual_dist = residual_dist.cpu().numpy().flatten()
+        embeddings = model(x_agg).cpu().numpy()
 
-    # שלב 3: שקלול עם ציון מבני (Degree)
-    # צמתים מבודדים הם אנומליות מבניות
-    degrees = df['degree'].values
-    # נרמול המרחק והדרגה
-    norm_dist = (residual_dist - residual_dist.min()) / (residual_dist.max() - residual_dist.min())
-    # ציון אנומליה: מרחק שארית גבוה + דרגה נמוכה
-    df['anomaly_score'] = norm_dist + (1.0 / (degrees + 1.0))
+    # 3. זיהוי אנומליות עם Isolation Forest
+    print("--- Running Isolation Forest ---")
+    # contamination מוגדר על פי יחס הזיופים בדאטה
+    contamination_rate = len(df[df['is_anomaly'] == 1]) / len(df)
+    clf = IsolationForest(contamination=contamination_rate, random_state=42)
     
-    # תוצאות
-    df_sorted = df.sort_values(by='anomaly_score', ascending=False)
-    num_fakes = df['is_anomaly'].sum()
-    detected = df_sorted.head(num_fakes)['is_anomaly'].sum()
+    # חיזוי (1- תקין, -1 אנומליה)
+    preds = clf.fit_predict(embeddings)
+    df['prediction'] = [1 if p == -1 else 0 for p in preds] # המרת -1 ל-1 (אנומליה)
+
+    # 4. ולידציה על ה-Fakes שהזרקנו
+    y_true = df['is_anomaly']
+    y_pred = df['prediction']
     
-    print("\n" + "="*50)
-    print(f"Lorentzian Residual Detection Results:")
-    print(f"Detected {detected} / {num_fakes} fakes in Top {num_fakes}")
-    print(f"Precision: {detected / num_fakes:.4f}")
+    recall = recall_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
     
-    print("\nTop 10 Lorentzian Anomalies (Structural + Content Mismatch):")
-    for i, (idx, row) in enumerate(df_sorted.head(10).iterrows()):
-        label = "[FAKE]" if row['is_anomaly'] == 1 else "[REAL]"
-        print(f"#{i+1} {label} Score: {row['anomaly_score']:.4f} | FOS: {row['fos.name']} | Title: {row['title'][:45]}...")
-    print("="*50)
-    
-    df_sorted.to_csv("residual_anomaly_results.csv", index=False)
+    print("\n" + "="*30)
+    print(f"Results for Anomaly Detection:")
+    print(f"Recall (Detection Rate of Fakes): {recall:.4%}")
+    print(f"Precision: {precision:.4%}")
+    print(f"F1 Score: {f1:.4%}")
+    print("="*30)
+
+    if recall >= 0.85:
+        print("Success! Reached target accuracy of 85%+")
+    else:
+        print("Target not reached. Consider increasing TF-IDF features or GNN steps (K).")
 
 if __name__ == "__main__":
-    main()
+    run_anomaly_detection()
