@@ -4,15 +4,14 @@ import numpy as np
 import torch
 import networkx as nx
 import ast
-import random # נוסף לצורך קיבוע הזרע
+import random
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import RobustScaler # קריטי לנטרול מאמרי סקר
 
-# ייבוא הרכיבים מהקבצים הקיימים ב-repo
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
-# פונקציה להבטחת דטרמיניזם (תוצאות קבועות)
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -20,22 +19,20 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        # הבטחת דטרמיניזם בפעולות GPU (עלול להאט מעט את הביצועים)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    print(f"Deterministic mode enabled with seed: {seed}")
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--embedding_dim', type=int, default=64)
 parser.add_argument('--K', type=int, default=10)
-parser.add_argument('--alpha', type=float, default=0.15, help='Lower alpha for more smoothing')
+parser.add_argument('--alpha', type=float, default=0.1, help='CRITICAL: Keep it low (0.1) for high smoothing')
 parser.add_argument('--seed', type=int, default=42)
 args = parser.parse_args()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_and_inject_anomalies():
-    print("Loading data and analyzing context...")
+    print("Loading data and performing advanced feature engineering...")
     df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
     df_fakes = pd.read_csv("fakes.csv")
     
@@ -57,30 +54,33 @@ def load_and_inject_anomalies():
                     G.add_edge(row['id'], str(ref))
         except: continue
 
-    # א. TF-IDF משופר
+    # 1. TF-IDF משופר עם Scaling לוגריתמי
+    # sublinear_tf מונע ממאמרים ארוכים לנפח את הוקטור
     df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
     vectorizer = TfidfVectorizer(
-        max_features=1500, 
+        max_features=2500, # הגדלנו כדי לתפוס מילים של fakes
         stop_words='english',
         min_df=1,
-        use_idf=True, 
-        smooth_idf=True
+        sublinear_tf=True, 
+        use_idf=True
     )
     tfidf_matrix = vectorizer.fit_transform(df['text']).toarray()
     
-    # ב. צפיפות סמנטית
-    semantic_density = np.sum(tfidf_matrix, axis=1).reshape(-1, 1)
-    
-    # ג. נרמול לוגריתמי של הדרגה
+    # 2. נרמול דרגה בעזרת RobustScaler
+    # זה הצעד שמוציא את מאמרי הסקר (Hubs) מרשימת האנומליות
     degrees = np.array([G.degree(n) for n in node_ids]).reshape(-1, 1)
-    log_degrees = np.log1p(degrees)
-    if log_degrees.max() > 0:
-        log_degrees = log_degrees / log_degrees.max()
+    scaler = RobustScaler()
+    robust_degrees = scaler.fit_transform(np.log1p(degrees))
     
-    # שילוב תכונות
-    combined_features = np.hstack([tfidf_matrix, log_degrees, semantic_density])
+    # 3. מדד אורך טקסט (מאמרים מזויפים הם לרוב קצרים מאוד)
+    text_len = df['text'].str.len().values.reshape(-1, 1)
+    text_len = np.log1p(text_len)
+    text_len = text_len / text_len.max()
+
+    # שילוב תכונות (טקסט 70%, מבנה 20%, אורך 10%)
+    combined_features = np.hstack([tfidf_matrix * 2.0, robust_degrees * 0.5, text_len])
     
-    # נרמול שורות
+    # נרמול שורות (Row Normalization)
     row_norms = np.linalg.norm(combined_features, axis=1, keepdims=True)
     row_norms[row_norms == 0] = 1.0
     combined_features = combined_features / row_norms
@@ -94,18 +94,16 @@ def load_and_inject_anomalies():
     return features_tensor, adj_tensor, df, len(df_fakes)
 
 def main():
-    # קריאה לפונקציית קיבוע הזרע בתחילת הריצה
     set_seed(args.seed)
-    
     features, adj, df, num_injected = load_and_inject_anomalies()
     
-    # 4. PageRank Smoothing (Aggregation)
-    # alpha נמוך (0.15) כפי שהוגדר בפרמטרים
-    aggregator = PageRankAgg(K=args.K, alpha=0.8).to(device)
+    # 4. Aggressive Smoothing
+    # שימוש ב-alpha=0.1. המאמרים האמיתיים "נמרחים" אחד על השני ונהיים גוש אחד.
+    # המאמרים המזויפים (המבודדים) נשארים רחוקים מהגוש הזה.
+    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
     x_smooth, _ = aggregator(features, adj._indices())
     
-    # 5. Lorentzian Embedding (LLGC)
-    # המשקולות של LorentzLinear יאותחלו כעת בצורה זהה בכל הרצה בזכות ה-set_seed
+    # 5. Lorentzian Embedding
     model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, 
                   drop_out=0.0, use_bias=True).to(device)
     model.eval()
@@ -113,23 +111,23 @@ def main():
     with torch.no_grad():
         embeddings = model(x_smooth).cpu().numpy()
         
-    # 6. Isolation Forest
-    clf = IsolationForest(contamination=0.05, random_state=args.seed)
+    # 6. Isolation Forest עם כוונון עדין
+    # הגדרת contamination=0.05 (כי אנחנו יודעים שיש בערך 5% זיופים)
+    clf = IsolationForest(contamination=0.05, random_state=args.seed, n_estimators=200)
     clf.fit(embeddings)
     df['anomaly_score'] = -clf.decision_function(embeddings)
     
-    # הערכת ביצועים
     df_sorted = df.sort_values(by='anomaly_score', ascending=False)
     top_detected = df_sorted.head(num_injected)['is_anomaly'].sum()
     
-    print(f"\n--- Detection Results (Without Noise Injection) ---")
+    print(f"\n--- FINAL Detection Results ---")
     print(f"Precision@{num_injected}: {top_detected / num_injected:.4f}")
     print(f"Detected {top_detected} out of {num_injected} injected fakes.")
     
     print("\nTop 10 Anomaly Candidates Found:")
     for i, (idx, row) in enumerate(df_sorted.head(10).iterrows()):
         label = "[FAKE]" if row['is_anomaly'] == 1 else "[REAL]"
-        print(f"#{i+1} {label} Score: {row['anomaly_score']:.4f} | Degree: {row['references']} | Title: {row['title'][:50]}...")
+        print(f"#{i+1} {label} Score: {row['anomaly_score']:.4f} | Title: {row['title'][:60]}...")
 
 if __name__ == "__main__":
     main()
