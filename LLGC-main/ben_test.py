@@ -94,8 +94,14 @@ def main():
         embeddings = model(x_smooth).cpu().numpy()
         
     # שלב 3: זיהוי אנומליות באמצעות Isolation Forest
+# שלב 3: זיהוי אנומליות באמצעות Isolation Forest
     print("Running Isolation Forest on embeddings...")
     clf = IsolationForest(contamination='auto', random_state=args.seed)
+    
+    # --- התיקון: אימון המודל על ה-embeddings שהופקו ---
+    clf.fit(embeddings) 
+    # --------------------------------------------------
+
     # ציון אנומליה (נמוך יותר = אנומלי יותר, לכן נהפוך סימן)
     anomaly_scores = -clf.decision_function(embeddings)
     df['anomaly_score'] = anomaly_scores
