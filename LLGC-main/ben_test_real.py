@@ -33,7 +33,7 @@ def build_adjacency_matrix(df):
     adj = nx.adjacency_matrix(G, nodelist=range(len(df)))
     
     # נרמול המטריצה כפי שמוגדר ב-utils.py
-    adj_normalized, _ = preprocess_citation(adj, np.zeros((len(df), 1)))
+    adj_normalized, _ = preprocess_citation(adj, np.zeros((len(df), 1)), normalization="AugNormAdj")
     return sparse_mx_to_torch_sparse_tensor(adj_normalized)
 
 # --- שאר הלוגיקה לשיפור הדיוק ---
