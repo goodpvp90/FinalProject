@@ -114,22 +114,29 @@ def detect_anomalies(Z, contamination):
 # 7. Inject Synthetic Anomalies
 # =========================================================
 def inject_anomalies(df, G, ratio=0.05, min_deg=1, max_deg=3):
+    """
+    Inject structurally anomalous nodes.
+    Works with ANY type of node IDs (int / str / mixed).
+    """
     df_new = df.copy()
     G_new = G.copy()
 
     n_fake = int(len(df) * ratio)
     fake_ids = []
 
-    existing_ids = set(df["id"])
-    next_id = max(existing_ids) + 1
+    existing_ids = set(df["id"].astype(str))
 
     nodes = list(G.nodes())
 
     for i in range(n_fake):
-        fake_id = next_id + i
-        fake_ids.append(fake_id)
+        fake_id = f"FAKE_{i}"
+        while fake_id in existing_ids:
+            fake_id = f"FAKE_{i}_{random.randint(0,9999)}"
 
-        # connect to very few random nodes → structural anomaly
+        fake_ids.append(fake_id)
+        existing_ids.add(fake_id)
+
+        # low-degree random attachment → structural anomaly
         deg = random.randint(min_deg, max_deg)
         targets = random.sample(nodes, deg)
 
