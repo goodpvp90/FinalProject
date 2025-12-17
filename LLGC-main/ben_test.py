@@ -113,12 +113,44 @@ def detect_anomalies(Z, contamination):
 # ============================================================
 # 7. Inject Synthetic Nodes from CSV
 # ============================================================
+def safe_parse_references(x):
+    """
+    Robust parsing of references field.
+    Handles:
+    - proper Python lists
+    - strings that fail literal_eval
+    - single IDs
+    - NaN / garbage
+    """
+    if isinstance(x, list):
+        return x
+
+    if not isinstance(x, str):
+        return []
+
+    try:
+        val = ast.literal_eval(x)
+        if isinstance(val, list):
+            return val
+        else:
+            return [val]
+    except Exception:
+        # fallback: extract tokens manually
+        x = x.strip().strip("[]")
+        if not x:
+            return []
+        return [token.strip() for token in x.split(",")]
+
 def inject_from_csv(df, fake_csv):
     df_fake = pd.read_csv(fake_csv)
-    df_fake["references"] = df_fake["references"].apply(
-        lambda x: ast.literal_eval(x) if isinstance(x, str) else []
-    )
+
+    if "references" in df_fake.columns:
+        df_fake["references"] = df_fake["references"].apply(safe_parse_references)
+    else:
+        df_fake["references"] = [[] for _ in range(len(df_fake))]
+
     df_fake["is_synthetic"] = True
+
     df_out = pd.concat([df, df_fake], ignore_index=True)
     return df_out
 
