@@ -53,7 +53,7 @@ def prepare_and_train_model():
     adj_real_tensor = sparse_mx_to_torch_sparse_tensor(adj_real).to(device)
 
     # יצירת המודל (LLGC) עם ממד פלט שמתאים למספר הקטגוריות
-    aggregator = PageRankAgg(K=10, alpha=0.15).to(device)
+    aggregator = PageRankAgg(K=10, alpha=0.8).to(device)
     model = LLGC(nfeat=500, nclass=num_classes, drop_out=0.1, use_bias=True).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
     
