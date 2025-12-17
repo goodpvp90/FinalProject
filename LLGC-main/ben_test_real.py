@@ -8,49 +8,35 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import OneHotEncoder
 
-# ייבוא הרכיבים המקוריים מה-Repo שלך
+# ייבוא הרכיבים מהקבצים הקיימים
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 from manifolds.lorentzian import Lorentzian
 
-# הגדרת פרמטרים (בדומה ל-run_cora.py)
-parser = argparse.ArgumentParser()
-parser.add_argument('--embedding_dim', type=int, default=16, help='ממד נמוך עוזר בזיהוי אנומליות מבניות')
-parser.add_argument('--K', type=int, default=10, help='מספר צעדי הפרופגציה')
-parser.add_argument('--alpha', type=float, default=0.5, help='איזון בין התכונות העצמיות לגרף')
-parser.add_argument('--seed', type=int, default=42)
-args = parser.parse_args()
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def prepare_custom_data():
-    print("Loading datasets...")
+def main():
+    # 1. טעינת הנתונים (מקור + הזרקת fakes)
     df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
     df_fakes = pd.read_csv("fakes.csv")
-    
-    # סימון Ground Truth
     df_real['is_anomaly'] = 0
     df_fakes['is_anomaly'] = 1
     df = pd.concat([df_real, df_fakes], ignore_index=True)
     df['id'] = df['id'].astype(str)
-    
-    # 1. תכונות טקסטואליות (TF-IDF)
-    print("Vectorizing text...")
-    tfidf = TfidfVectorizer(max_features=400, stop_words='english')
+
+    # 2. בניית תכונות (ללא רעש מלאכותי)
+    # טקסט (TF-IDF)
+    tfidf = TfidfVectorizer(max_features=500, stop_words='english')
     x_text = tfidf.fit_transform(df['title'].fillna('') + " " + df['abstract'].fillna('')).toarray()
     
-    # 2. תכונות קטגוריות (FOS) - המפתח לזיהוי ה-Fakes
-    # מכיוון של-Fakes יש FOS ייחודי (כמו Cooking), קידוד One-Hot יצור סיגנל חזק
-    print("Encoding FOS...")
+    # FOS (One-Hot) - המפתח לזיהוי חוסר התאמה קטגורי
     fos_enc = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-    x_fos = fos_enc.fit_transform(df[['fos.name']].fillna('Unknown'))
+    x_fos = fos_enc.fit_transform(df[['fos.name']].fillna('Other'))
     
-    # איחוד תכונות: טקסט + FOS
+    # איחוד (ללא ניפוח ערכים)
     x_all = np.hstack([x_text, x_fos])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     features = torch.FloatTensor(x_all).to(device)
-    
-    # 3. בניית גרף הציטוטים
-    print("Building citation graph...")
+
+    # 3. בניית הגרף
     node_ids = df['id'].tolist()
     node_to_idx = {nid: i for i, nid in enumerate(node_ids)}
     G = nx.Graph()
@@ -59,68 +45,58 @@ def prepare_custom_data():
         try:
             refs = ast.literal_eval(row['references'])
             for ref in refs:
-                ref_str = str(ref)
-                if ref_str in node_to_idx:
-                    G.add_edge(row['id'], ref_str)
+                if str(ref) in node_to_idx:
+                    G.add_edge(row['id'], str(ref))
         except: continue
         
     adj = nx.adjacency_matrix(G, nodelist=node_ids)
     adj, _ = preprocess_citation(adj, x_all, normalization="AugNormAdj")
-    adj_tensor = sparse_mx_to_torch_sparse_tensor(adj).to(device)
-    
-    return features, adj_tensor, df
+    edge_index = sparse_mx_to_torch_sparse_tensor(adj)._indices().to(device)
 
-def main():
-    # שלב א': הכנת נתונים
-    features, adj, df = prepare_custom_data()
+    # 4. עיבוד במרחב לורנץ
+    manifold = Lorentzian()
+    c = torch.tensor([1.0]).to(device)
     
-    # שלב ב': הרצת מודל LLGC (בדומה ל-run_cora)
-    # 1. PageRank Aggregation (Smoothing)
-    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
-    # x_smooth הוא הייצוג של המאמר "בקונטקסט" של השכנים שלו
-    x_smooth, _ = aggregator(features, adj._indices())
+    # אגרגציה של השכנים (PageRank) - אלפא=0.5 לאיזון בין הצומת לסביבה
+    aggregator = PageRankAgg(K=10, alpha=0.5).to(device)
+    x_smooth, _ = aggregator(features, edge_index)
     
-    # 2. Lorentzian Transformation
-    # המרת התכונות המוחלקות למרחב לורנץ בעזרת שכבת ה-LLGC
-    model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, use_bias=True).to(device)
+    # אתחול המודל עם תיקון ה-TypeError (הוספת drop_out=0.0)
+    model = LLGC(nfeat=features.size(1), nclass=64, drop_out=0.0, use_bias=True).to(device)
     model.eval()
-    
+
     with torch.no_grad():
-        # הפקת Embeddings לורנציאניים
+        # הפקת Embeddings (במישור המשיק)
         embeddings = model(x_smooth).cpu().numpy()
         
-    # שלב ג': זיהוי אנומליות בעזרת Isolation Forest על ה-Embeddings
-    # ה-IF יחפש נקודות שנמצאות ב"קצוות" או באזורים דלילים של המרחב ההיפרבולי
-    print("Running Isolation Forest on Lorentzian embeddings...")
-    clf = IsolationForest(contamination='auto', random_state=args.seed, n_jobs=-1)
-    
-    # אימון וחישוב ציון (הפיכת סימן כך שציון גבוה = אנומלי יותר)
+        # חישוב ה-Mismatch הלורנציאני:
+        # מרחק בין המאמר המקורי (במרחב לורנץ) לבין הייצוג הממוצע של שכניו
+        x_orig_loren = manifold.normalize_input(features, c)
+        x_smooth_loren = manifold.normalize_input(x_smooth, c)
+        mismatch_dist = manifold.induced_distance(x_orig_loren, x_smooth_loren, c).cpu().numpy().flatten()
+
+    # 5. זיהוי אנומליות
+    # אנומליה היא צומת שהוא גם חריג גלובלית (Isolation Forest) 
+    # וגם לא מתאים לסביבה שלו (Mismatch Distance)
+    clf = IsolationForest(contamination='auto', random_state=42)
     clf.fit(embeddings)
-    df['anomaly_score'] = -clf.decision_function(embeddings)
+    if_score = -clf.decision_function(embeddings)
     
-    # שלב ד': ניתוח תוצאות
+    # ציון סופי משולב
+    df['anomaly_score'] = if_score + (mismatch_dist / (mismatch_dist.max() + 1e-6))
+
+    # 6. הצגת תוצאות
     df_sorted = df.sort_values(by='anomaly_score', ascending=False)
+    num_fakes = len(df_fakes)
+    detected = df_sorted.head(num_fakes)['is_anomaly'].sum()
     
-    # חישוב דיוק (כמה מזויפים נכנסו ל-Top N)
-    num_fakes = df['is_anomaly'].sum()
-    top_candidates = df_sorted.head(num_fakes)
-    detected = top_candidates['is_anomaly'].sum()
+    print(f"\nFinal Results:\nDetected {detected} / {num_fakes} fakes.")
+    print(f"Precision@{num_fakes}: {detected/num_fakes:.4f}")
     
-    print("\n" + "="*50)
-    print(f"Results Summary:")
-    print(f"Detected {detected} out of {num_fakes} injected fakes.")
-    print(f"Precision@{num_fakes}: {detected / num_fakes:.4f}")
-    
-    # הצגת ה-Top 10 לזיהוי אנומליות טבעיות ומזויפות
-    print("\nTop 10 Anomaly Candidates:")
-    for i, (idx, row) in enumerate(df_sorted.head(10).iterrows()):
-        label = "[FAKE]" if row['is_anomaly'] == 1 else "[REAL]"
-        print(f"#{i+1} {label} Score: {row['anomaly_score']:.4f} | FOS: {row['fos.name']} | Title: {row['title'][:50]}...")
-    print("="*50)
-    
-    # שמירה ל-CSV
-    df_sorted[['id', 'title', 'fos.name', 'is_anomaly', 'anomaly_score']].to_csv("anomaly_results.csv", index=False)
-    print("Full results saved to anomaly_results.csv")
+    # שמירה ל-CSV לניתוח
+    df_sorted[['id', 'title', 'fos.name', 'is_anomaly', 'anomaly_score']].to_csv("deep_detection_results.csv", index=False)
+    print("\nTop 5 Candidates:")
+    print(df_sorted[['title', 'fos.name', 'is_anomaly', 'anomaly_score']].head(5))
 
 if __name__ == "__main__":
     main()
