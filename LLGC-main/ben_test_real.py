@@ -114,7 +114,7 @@ def main():
         embeddings = model(x_smooth).cpu().numpy()
         
     # 6. Isolation Forest
-    clf = IsolationForest(contamination=0.01, random_state=args.seed)
+    clf = IsolationForest(contamination=0.05, random_state=args.seed)
     clf.fit(embeddings)
     df['anomaly_score'] = -clf.decision_function(embeddings)
     
