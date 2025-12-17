@@ -9,7 +9,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import LabelEncoder
 
-# ייבוא מהקבצים הקיימים ב-Repo
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
@@ -19,12 +18,15 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 
 def prepare_and_train_model():
-    print("--- שלב 1: אימון המודל (Alpha נמוך ללמידת קשרים) ---")
+    print("--- שלב 1: אימון מודל עמוק (Embedding Dimension = 128) ---")
     df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
     
     le = LabelEncoder()
     df_real['label'] = le.fit_transform(df_real['fos.name'].fillna('Unknown'))
     num_classes = df_real['label'].nunique()
+    
+    # ממד Embedding גבוה יותר נותן יותר "אוויר" לאנומליות לבלוט
+    EMB_DIM = 128 
     
     vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
     x_tfidf = vectorizer.fit_transform(df_real['title'].fillna('') + " " + df_real['abstract'].fillna('')).toarray()
@@ -46,17 +48,24 @@ def prepare_and_train_model():
     adj_real, _ = preprocess_citation(adj_real, x_tfidf, normalization="AugNormAdj")
     adj_real_tensor = sparse_mx_to_torch_sparse_tensor(adj_real).to(device)
 
-    # אימון עם Alpha נמוך (0.15) כדי ללמוד את המבנה הקהילתי
     aggregator = PageRankAgg(K=10, alpha=0.15).to(device)
-    model = LLGC(nfeat=500, nclass=num_classes, drop_out=0.1, use_bias=True).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    
+    # מודל ה-LLGC יוציא 128 ממדים
+    model = LLGC(nfeat=500, nclass=EMB_DIM, drop_out=0.1, use_bias=True).to(device)
+    # ראש סיווג חיצוני לצורך האימון בלבד
+    classifier_head = torch.nn.Linear(EMB_DIM, num_classes).to(device)
+    
+    optimizer = optim.Adam(list(model.parameters()) + list(classifier_head.parameters()), lr=0.01)
     
     model.train()
     x_smooth, _ = aggregator(features_real, adj_real_tensor._indices())
-    for epoch in range(101):
+    
+    print("מתחיל אימון אינטנסיבי (200 Epochs)...")
+    for epoch in range(201):
         optimizer.zero_grad()
-        output = model(x_smooth)
-        loss = F.cross_entropy(output, labels_real)
+        embeddings = model(x_smooth)
+        logits = classifier_head(embeddings)
+        loss = F.cross_entropy(logits, labels_real)
         loss.backward()
         optimizer.step()
         if epoch % 50 == 0: print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
@@ -64,7 +73,7 @@ def prepare_and_train_model():
     return model, vectorizer, df_real
 
 def inject_and_detect(trained_model, vectorizer, df_real):
-    print("\n--- שלב 2: זיהוי אנומליות (Alpha גבוה לשימור סיגנל) ---")
+    print("\n--- שלב 2: זיהוי אנומליות במרחב ה-128D ---")
     df_fakes = pd.read_csv("fakes.csv")
     df_fakes['is_anomaly'] = 1
     df_real['is_anomaly'] = 0
@@ -73,7 +82,7 @@ def inject_and_detect(trained_model, vectorizer, df_real):
     x_combined_tfidf = vectorizer.transform(df_combined['title'].fillna('') + " " + df_combined['abstract'].fillna('')).toarray()
     for i, row in df_combined.iterrows():
         if row['is_anomaly'] == 1:
-            x_combined_tfidf[i] = np.random.uniform(-1, 1, 500) # הזרקת רעש
+            x_combined_tfidf[i] = np.random.uniform(-1, 1, 500) # רעש אקראי
             
     features_combined = torch.FloatTensor(x_combined_tfidf).to(device)
     
@@ -93,7 +102,7 @@ def inject_and_detect(trained_model, vectorizer, df_real):
     adj_combined, _ = preprocess_citation(adj_combined, x_combined_tfidf, normalization="AugNormAdj")
     adj_combined_tensor = sparse_mx_to_torch_sparse_tensor(adj_combined).to(device)
 
-    # שימוש ב-Alpha גבוה (0.8) כדי למנוע מהשכנים למחוק את הרעש
+    # זיהוי עם Alpha גבוה (0.8)
     aggregator_detect = PageRankAgg(K=10, alpha=0.8).to(device)
     trained_model.eval()
     with torch.no_grad():
@@ -108,7 +117,7 @@ def inject_and_detect(trained_model, vectorizer, df_real):
     num_fakes = len(df_fakes)
     detected = df_sorted.head(num_fakes)['is_anomaly'].sum()
     
-    print(f"\nResults Summary: Precision@{num_fakes}: {detected / num_fakes:.4f} (Detected {detected}/{num_fakes})")
+    print(f"\nFinal Results: Precision@{num_fakes}: {detected / num_fakes:.4f} (Detected {detected}/{num_fakes})")
     return df_sorted
 
 # הרצה
