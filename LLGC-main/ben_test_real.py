@@ -1,112 +1,133 @@
-import argparse
 import pandas as pd
 import numpy as np
 import torch
+import torch.nn.functional as F
+import torch.optim as optim
 import networkx as nx
 import ast
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import LabelEncoder
 
-# ייבוא הרכיבים מהקבצים הקיימים בתיקייה
+# ייבוא המודלים המקוריים
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
-# הגדרת פרמטרים אופטימליים לזיהוי אנומליות מבניות
-parser = argparse.ArgumentParser()
-parser.add_argument('--embedding_dim', type=int, default=64, help='Dimension of Lorentzian embeddings')
-parser.add_argument('--K', type=int, default=10, help='Number of propagation steps')
-# Alpha נמוך (0.1) מאפשר למידע מהגרף לזרום ולזהות אנומליות מבניות
-parser.add_argument('--alpha', type=float, default=0.1, help='Lower alpha emphasizes graph structure')
-parser.add_argument('--seed', type=int, default=42, help='Random seed')
-args = parser.parse_args()
+# הגדרות מכשיר וזרע רנדומלי
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 42
+torch.manual_seed(SEED)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-def load_real_data():
-    """
-    טעינת הדאטאסט המקורי ללא הזרקות
-    """
-    print("Loading original dataset...")
-    # טעינת קובץ הנתונים המקורי שלך
-    df = pd.read_csv("final_filtered_by_fos_and_reference.csv")
-    df['id'] = df['id'].astype(str)
+def prepare_and_train_model():
+    print("--- שלב 1: אימון המודל על הדאטאסט המקורי ---")
+    df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
     
-    node_ids = df['id'].tolist()
-    node_to_idx = {node_id: i for i, node_id in enumerate(node_ids)}
+    # הכנת תיוגים לאימון (נניח שקיימת עמודת 'fos')
+    if 'fos' not in df_real.columns:
+        print("אזהרה: לא נמצאה עמודת 'fos'. האימון יתבצע על תיוגים רנדומליים (לא מומלץ) או שנדלג על האימון.")
+        df_real['label'] = 0 
+    else:
+        le = LabelEncoder()
+        df_real['label'] = le.fit_transform(df_real['fos'].fillna('Unknown'))
     
-    # בניית גרף הציטוטים
-    G = nx.Graph()
-    G.add_nodes_from(node_ids)
-    print("Building citation graph (Edges based on references)...")
-    for _, row in df.iterrows():
+    num_classes = df_real['label'].nunique()
+    
+    # בניית פיצ'רים (TF-IDF)
+    vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
+    x_tfidf = vectorizer.fit_transform(df_real['title'].fillna('') + " " + df_real['abstract'].fillna('')).toarray()
+    features_real = torch.FloatTensor(x_tfidf).to(device)
+    labels_real = torch.LongTensor(df_real['label'].values).to(device)
+    
+    # בניית גרף מקורי
+    node_ids = df_real['id'].astype(str).tolist()
+    node_to_idx = {nid: i for i, nid in enumerate(node_ids)}
+    G_real = nx.Graph()
+    G_real.add_nodes_from(node_ids)
+    for _, row in df_real.iterrows():
         try:
             refs = ast.literal_eval(row['references'])
             for ref in refs:
-                if str(ref) in node_to_idx:
-                    G.add_edge(row['id'], str(ref))
-        except:
-            continue
-
-    # הפקת פיצ'רים טקסטואליים בסיסיים
-    print("Vectorizing titles and abstracts...")
-    df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
-    vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(df['text']).toarray()
-    
-    features = torch.FloatTensor(tfidf_matrix).to(device)
-    
-    # הכנת מטריצת שכנות נורמלית
-    adj = nx.adjacency_matrix(G, nodelist=node_ids)
-    adj, _ = preprocess_citation(adj, tfidf_matrix, normalization="AugNormAdj")
-    adj_tensor = sparse_mx_to_torch_sparse_tensor(adj).to(device)
-    
-    return features, adj_tensor, df
-
-def main():
-    # 1. טעינת נתונים
-    features, adj, df = load_real_data()
-    
-    # 2. PageRank Aggregation - שלב ה"החלקה" המבני
-    print(f"Running PageRank smoothing (Alpha={args.alpha}, K={args.K})...")
-    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
-    x_smooth, _ = aggregator(features, adj._indices())
-    
-    # 3. Lorentzian Projection (LLGC) - הטלה למרחב היפרבולי
-    # המודל משמש כ-Encoder שממפה את הקשרים למרחב לורנץ
-    model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, 
-                 drop_out=0.0, use_bias=True).to(device)
-    model.eval()
-    
-    with torch.no_grad():
-        # הפקת ה-Embeddings הסופיים
-        embeddings = model(x_smooth).cpu().numpy()
+                if str(ref) in node_to_idx: G_real.add_edge(str(row['id']), str(ref))
+        except: continue
         
-    # 4. זיהוי חריגים באמצעות Isolation Forest
-    print("Detecting real anomalies in the dataset...")
-    clf = IsolationForest(contamination=0.01, random_state=args.seed, n_jobs=-1)
+    adj_real = nx.adjacency_matrix(G_real, nodelist=node_ids)
+    adj_real, _ = preprocess_citation(adj_real, x_tfidf, normalization="AugNormAdj")
+    adj_real_tensor = sparse_mx_to_torch_sparse_tensor(adj_real).to(device)
+
+    # אימון המודל (בדומה ל-run_cora.py)
+    aggregator = PageRankAgg(K=10, alpha=0.15).to(device)
+    x_smooth, _ = aggregator(features_real, adj_real_tensor._indices())
+    
+    model = LLGC(nfeat=500, nclass=num_classes, drop_out=0.1, use_bias=True).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+    
+    model.train()
+    print("מתחיל אימון...")
+    for epoch in range(100): # 100 איטרציות אימון
+        optimizer.zero_grad()
+        output = model(x_smooth)
+        loss = F.cross_entropy(output, labels_real)
+        loss.backward()
+        optimizer.step()
+        if epoch % 20 == 0: print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+        
+    return model, vectorizer, node_to_idx, df_real
+
+def inject_and_detect(trained_model, vectorizer, df_real):
+    print("\n--- שלב 2: הזרקת אנומליות וזיהוי ---")
+    df_fakes = pd.read_csv("fakes.csv")
+    df_fakes['is_anomaly'] = 1
+    df_real['is_anomaly'] = 0
+    
+    df_combined = pd.concat([df_real, df_fakes], ignore_index=True)
+    df_combined['id'] = df_combined['id'].astype(str)
+    
+    # הפקת פיצ'רים לגרף המאוחד
+    x_combined_tfidf = vectorizer.transform(df_combined['title'].fillna('') + " " + df_combined['abstract'].fillna('')).toarray()
+    
+    # הזרקת רעש לאנומליות כדי שיהיו Outliers (כמו שעשינו קודם)
+    for i, row in df_combined.iterrows():
+        if row['is_anomaly'] == 1:
+            x_combined_tfidf[i] = np.random.uniform(-1, 1, 500)
+            
+    features_combined = torch.FloatTensor(x_combined_tfidf).to(device)
+    
+    # בניית גרף מאוחד
+    node_ids = df_combined['id'].tolist()
+    node_to_idx = {nid: i for i, nid in enumerate(node_ids)}
+    G_combined = nx.Graph()
+    G_combined.add_nodes_from(node_ids)
+    for _, row in df_combined.iterrows():
+        try:
+            refs = ast.literal_eval(row['references'])
+            for ref in refs:
+                if str(ref) in node_to_idx: G_combined.add_edge(str(row['id']), str(ref))
+        except: continue
+        
+    adj_combined = nx.adjacency_matrix(G_combined, nodelist=node_ids)
+    adj_combined, _ = preprocess_citation(adj_combined, x_combined_tfidf, normalization="AugNormAdj")
+    adj_combined_tensor = sparse_mx_to_torch_sparse_tensor(adj_combined).to(device)
+
+    # הרצת המודל המאומן על הגרף המאוחד
+    trained_model.eval()
+    aggregator = PageRankAgg(K=10, alpha=0.15).to(device)
+    with torch.no_grad():
+        x_smooth_comb, _ = aggregator(features_combined, adj_combined_tensor._indices())
+        embeddings = trained_model(x_smooth_comb).cpu().numpy()
+        
+    # זיהוי אנומליות
+    clf = IsolationForest(contamination='auto', random_state=SEED)
     clf.fit(embeddings)
+    df_combined['anomaly_score'] = -clf.decision_function(embeddings)
     
-    # חישוב ציוני אנומליה (גבוה יותר = אנומלי יותר)
-    df['anomaly_score'] = -clf.decision_function(embeddings)
+    # תוצאות
+    df_sorted = df_combined.sort_values(by='anomaly_score', ascending=False)
+    num_fakes = len(df_fakes)
+    detected = df_sorted.head(num_fakes)['is_anomaly'].sum()
     
-    # 5. הצגת תוצאות
-    df_sorted = df.sort_values(by='anomaly_score', ascending=False)
-    
-    print("\n" + "="*50)
-    print("TOP 10 NATURAL ANOMALY CANDIDATES FOUND:")
-    print("="*50)
-    
-    for i, (idx, row) in enumerate(df_sorted.head(10).iterrows()):
-        print(f"#{i+1} | Score: {row['anomaly_score']:.4f}")
-        print(f"    ID: {row['id']}")
-        print(f"    Title: {row['title']}")
-        print(f"    Year: {row.get('year', 'N/A')}")
-        print("-" * 30)
+    print(f"Results: Detected {detected} / {num_fakes} fakes (Precision: {detected/num_fakes:.4f})")
+    return df_sorted
 
-    # שמירת התוצאות לקובץ CSV לניתוח מעמיק
-    output_file = "real_detection_results.csv"
-    df_sorted.to_csv(output_file, index=False)
-    print(f"\nFull results saved to: {output_file}")
-
-if __name__ == "__main__":
-    main()
+# הרצה
+model, vec, idx, df_real = prepare_and_train_model()
+results = inject_and_detect(model, vec, df_real)
