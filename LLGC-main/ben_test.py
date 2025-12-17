@@ -6,6 +6,7 @@ import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 import random
+from copy import deepcopy
 
 from model import LLGC, PageRankAgg
 
@@ -29,187 +30,186 @@ df["references"] = df["references"].apply(
 )
 
 # =========================================================
-# 2. Build Graph (UNDIRECTED, CLEAN)
+# 2. Build Graph
 # =========================================================
-G = nx.Graph()
-paper_ids = set(df["id"])
-
-for pid in paper_ids:
-    G.add_node(pid)
-
-for _, row in df.iterrows():
-    for ref in row["references"]:
-        if ref in paper_ids:
-            G.add_edge(row["id"], ref)
-
-node_list = list(G.nodes())
-id_to_idx = {n: i for i, n in enumerate(node_list)}
-
-print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+def build_graph(df):
+    G = nx.Graph()
+    ids = set(df["id"])
+    for pid in ids:
+        G.add_node(pid)
+    for _, row in df.iterrows():
+        for ref in row["references"]:
+            if ref in ids:
+                G.add_edge(row["id"], ref)
+    return G
 
 # =========================================================
-# 3. STRUCTURAL FEATURES (DETERMINISTIC)
+# 3. Structural Features
 # =========================================================
-print("Building structural features...")
+def build_features(G):
+    node_list = list(G.nodes())
+    deg = dict(G.degree())
+    pagerank = nx.pagerank(G)
+    clustering = nx.clustering(G)
 
-deg = dict(G.degree())
-pagerank = nx.pagerank(G, alpha=0.85)
-clustering = nx.clustering(G)
+    X = []
+    for n in node_list:
+        X.append([
+            deg.get(n, 0),
+            pagerank.get(n, 0),
+            clustering.get(n, 0)
+        ])
 
-X = []
-for n in node_list:
-    X.append([
-        deg.get(n, 0),
-        pagerank.get(n, 0),
-        clustering.get(n, 0)
-    ])
-
-X = np.array(X, dtype=np.float32)
-
-scaler = StandardScaler()
-X = scaler.fit_transform(X)
-
-X_tensor = torch.tensor(X, dtype=torch.float32).to(DEVICE)
-
-print("Feature matrix shape:", X_tensor.shape)
+    X = np.array(X, dtype=np.float32)
+    X = StandardScaler().fit_transform(X)
+    return node_list, torch.tensor(X, dtype=torch.float32).to(DEVICE)
 
 # =========================================================
-# 4. EDGE INDEX (PyG FORMAT)
+# 4. Edge Index
 # =========================================================
-edges = []
-for u, v in G.edges():
-    edges.append([id_to_idx[u], id_to_idx[v]])
-    edges.append([id_to_idx[v], id_to_idx[u]])
-
-edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(DEVICE)
-
-# =========================================================
-# 5. PageRankAgg (NO MANUAL NORMALIZATION)
-# =========================================================
-sgconv = PageRankAgg(
-    K=5,
-    alpha=0.1,
-    add_self_loops=True,
-    normalize=True
-).to(DEVICE)
-
-X_gconv, _ = sgconv(X_tensor, edge_index)
+def build_edge_index(G, node_list):
+    id2idx = {n: i for i, n in enumerate(node_list)}
+    edges = []
+    for u, v in G.edges():
+        edges.append([id2idx[u], id2idx[v]])
+        edges.append([id2idx[v], id2idx[u]])
+    return torch.tensor(edges, dtype=torch.long).t().contiguous().to(DEVICE)
 
 # =========================================================
-# 6. Train LLGC (UNSUPERVISED)
+# 5. Train LLGC
 # =========================================================
-EMB_DIM = 128
-EPOCHS = 100
-LR = 0.01
-DROP_OUT = 0.0
-USE_BIAS = True
+def train_llgc(X_gconv, edge_index, emb_dim=128, epochs=100):
+    model = LLGC(
+        nfeat=X_gconv.size(1),
+        nclass=emb_dim,
+        drop_out=0.0,
+        use_bias=True
+    ).to(DEVICE)
 
-model = LLGC(
-    nfeat=X_gconv.size(1),
-    nclass=EMB_DIM,
-    drop_out=DROP_OUT,
-    use_bias=USE_BIAS
-).to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=0.01)
+    model.train()
 
-optimizer = optim.Adam(model.parameters(), lr=LR)
+    for _ in range(epochs):
+        opt.zero_grad()
+        Z = model(X_gconv)
+        r, c = edge_index
+        loss = (Z[r] - Z[c]).pow(2).sum(dim=1).mean()
+        loss.backward()
+        opt.step()
 
-model.train()
-for epoch in range(EPOCHS):
-    optimizer.zero_grad()
-    Z = model(X_gconv)
-
-    row, col = edge_index
-    loss = (Z[row] - Z[col]).pow(2).sum(dim=1).mean()
-
-    loss.backward()
-    optimizer.step()
-
-print("Initial training completed")
+    return model
 
 # =========================================================
-# 7. Anomaly Detection
+# 6. Detect Anomalies
 # =========================================================
-model.eval()
-with torch.no_grad():
-    Z = model(X_gconv).cpu().numpy()
+def detect_anomalies(Z, contamination):
+    iso = IsolationForest(
+        contamination=contamination,
+        random_state=SEED
+    )
+    pred = iso.fit_predict(Z)
+    return pred
 
-contamination = max(0.01, 1.0 / len(Z))
-iso = IsolationForest(
-    contamination=contamination,
-    random_state=SEED
+# =========================================================
+# 7. Inject Synthetic Anomalies
+# =========================================================
+def inject_anomalies(df, G, ratio=0.05, min_deg=1, max_deg=3):
+    df_new = df.copy()
+    G_new = G.copy()
+
+    n_fake = int(len(df) * ratio)
+    fake_ids = []
+
+    existing_ids = set(df["id"])
+    next_id = max(existing_ids) + 1
+
+    nodes = list(G.nodes())
+
+    for i in range(n_fake):
+        fake_id = next_id + i
+        fake_ids.append(fake_id)
+
+        # connect to very few random nodes → structural anomaly
+        deg = random.randint(min_deg, max_deg)
+        targets = random.sample(nodes, deg)
+
+        G_new.add_node(fake_id)
+        for t in targets:
+            G_new.add_edge(fake_id, t)
+
+        df_new = pd.concat([
+            df_new,
+            pd.DataFrame([{
+                "id": fake_id,
+                "references": targets,
+                "is_synthetic": True
+            }])
+        ], ignore_index=True)
+
+    df_new["is_synthetic"] = df_new.get("is_synthetic", False).fillna(False)
+    return df_new, G_new, fake_ids
+
+# =========================================================
+# 8. MAIN PIPELINE
+# =========================================================
+print("\n=== INITIAL TRAINING ===")
+
+G = build_graph(df)
+nodes, X = build_features(G)
+edge_index = build_edge_index(G, nodes)
+
+sgc = PageRankAgg(K=5, alpha=0.1).to(DEVICE)
+X_gconv, _ = sgc(X, edge_index)
+
+model = train_llgc(X_gconv, edge_index)
+
+Z = model(X_gconv).detach().cpu().numpy()
+pred = detect_anomalies(Z, contamination=0.01)
+
+anomalous_ids = [nodes[i] for i, p in enumerate(pred) if p == -1]
+print(f"Detected initial anomalies: {len(anomalous_ids)}")
+
+# =========================================================
+# 9. CLEAN → CORE GRAPH
+# =========================================================
+df_core = df[~df["id"].isin(anomalous_ids)]
+G_core = build_graph(df_core)
+
+print(f"Core size after cleaning: {len(df_core)}")
+
+nodes_c, X_c = build_features(G_core)
+edge_index_c = build_edge_index(G_core, nodes_c)
+Xc_gconv, _ = sgc(X_c, edge_index_c)
+
+model_core = train_llgc(Xc_gconv, edge_index_c)
+
+# =========================================================
+# 10. INJECT SYNTHETIC ANOMALIES
+# =========================================================
+print("\n=== INJECTING SYNTHETIC ANOMALIES ===")
+
+df_injected, G_injected, fake_ids = inject_anomalies(
+    df_core, G_core, ratio=0.05
 )
-pred = iso.fit_predict(Z)
-scores = iso.decision_function(Z)
 
-anomalous_nodes = [
-    node_list[i] for i in range(len(pred)) if pred[i] == -1
-]
+nodes_i, Xi = build_features(G_injected)
+edge_index_i = build_edge_index(G_injected, nodes_i)
+Xi_gconv, _ = sgc(Xi, edge_index_i)
 
-print(f"Detected anomalies: {len(anomalous_nodes)}")
-
-# =========================================================
-# 8. CORE GRAPH (REMOVE ANOMALIES)
-# =========================================================
-df_core = df[~df["id"].isin(anomalous_nodes)].copy()
-print(f"Core dataset size: {len(df_core)}")
+Zi = model_core(Xi_gconv).detach().cpu().numpy()
+pred_i = detect_anomalies(Zi, contamination=len(fake_ids)/len(Zi))
 
 # =========================================================
-# 9. REBUILD GRAPH + RETRAIN CORE MODEL
+# 11. VALIDATION
 # =========================================================
-G_core = nx.Graph()
-core_ids = set(df_core["id"])
+idx_map = {n: i for i, n in enumerate(nodes_i)}
 
-for pid in core_ids:
-    G_core.add_node(pid)
+detected = 0
+for fid in fake_ids:
+    if pred_i[idx_map[fid]] == -1:
+        detected += 1
 
-for _, row in df_core.iterrows():
-    for ref in row["references"]:
-        if ref in core_ids:
-            G_core.add_edge(row["id"], ref)
-
-node_list_core = list(G_core.nodes())
-id_to_idx_core = {n: i for i, n in enumerate(node_list_core)}
-
-deg = dict(G_core.degree())
-pagerank = nx.pagerank(G_core)
-clustering = nx.clustering(G_core)
-
-Xc = []
-for n in node_list_core:
-    Xc.append([
-        deg.get(n, 0),
-        pagerank.get(n, 0),
-        clustering.get(n, 0)
-    ])
-
-Xc = scaler.fit_transform(np.array(Xc, dtype=np.float32))
-Xc = torch.tensor(Xc, dtype=torch.float32).to(DEVICE)
-
-edges_core = []
-for u, v in G_core.edges():
-    edges_core.append([id_to_idx_core[u], id_to_idx_core[v]])
-    edges_core.append([id_to_idx_core[v], id_to_idx_core[u]])
-
-edge_index_core = torch.tensor(edges_core, dtype=torch.long).t().contiguous().to(DEVICE)
-
-Xc_gconv, _ = sgconv(Xc, edge_index_core)
-
-model_core = LLGC(
-    nfeat=Xc_gconv.size(1),
-    nclass=EMB_DIM,
-    drop_out=DROP_OUT,
-    use_bias=USE_BIAS
-).to(DEVICE)
-
-optimizer = optim.Adam(model_core.parameters(), lr=LR)
-
-model_core.train()
-for epoch in range(EPOCHS):
-    optimizer.zero_grad()
-    Zc = model_core(Xc_gconv)
-    r, c = edge_index_core
-    loss = (Zc[r] - Zc[c]).pow(2).sum(dim=1).mean()
-    loss.backward()
-    optimizer.step()
-
-print("✔ Core model ready")
+print("\n=== VALIDATION RESULTS ===")
+print(f"Injected anomalies: {len(fake_ids)}")
+print(f"Detected anomalies: {detected}")
+print(f"Detection rate: {detected / len(fake_ids):.2%}")
