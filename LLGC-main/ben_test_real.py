@@ -6,26 +6,23 @@ import networkx as nx
 import ast
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, normalize
 
-# ייבוא הרכיבים מהקבצים ב-Repo
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--embedding_dim', type=int, default=64)
+parser.add_argument('--embedding_dim', type=int, default=128) # הגדלת ממד
 parser.add_argument('--K', type=int, default=10)
-# העלאה ל-0.5 כדי לשמור על ה-FOS המקורי של המאמר
-parser.add_argument('--alpha', type=float, default=0.5) 
-# משקל אגרסיבי ל-FOS
-parser.add_argument('--fos_weight', type=float, default=20.0) 
+parser.add_argument('--alpha', type=float, default=0.7) # Alpha גבוה לשימור FOS
+parser.add_argument('--fos_weight', type=float, default=50.0) # משקל אגרסיבי מאוד
 parser.add_argument('--seed', type=int, default=42)
 args = parser.parse_args()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def load_data_high_fos():
-    print(f"Loading data with high FOS focus (Weight: {args.fos_weight})...")
+def load_data_ultra_fos():
+    print(f"Loading data with Ultra FOS focus (Weight: {args.fos_weight})...")
     df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
     df_fakes = pd.read_csv("fakes.csv")
     
@@ -34,12 +31,14 @@ def load_data_high_fos():
     df = pd.concat([df_real, df_fakes], ignore_index=True)
     df['id'] = df['id'].astype(str)
     
-    # 1. טקסט - נרמול הפיצ'רים לרמה של 0 עד 1
+    # 1. טקסט + נרמול L2 (חשוב מאוד!)
     df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
     vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
     text_features = vectorizer.fit_transform(df['text']).toarray()
+    # נרמול כל שורה כך שסכום הריבועים יהיה 1 - מונע מטקסט ארוך להשתלט
+    text_features = normalize(text_features, norm='l2')
     
-    # 2. FOS - קידוד ומתן משקל גבוה
+    # 2. FOS משוקלל
     fos_encoder = OneHotEncoder(sparse_output=False)
     fos_features = fos_encoder.fit_transform(df[['fos.name']].fillna('Unknown'))
     weighted_fos = fos_features * args.fos_weight
@@ -67,11 +66,13 @@ def load_data_high_fos():
     return features_tensor, adj_tensor, df
 
 def main():
-    features, adj, df = load_data_high_fos()
+    features, adj, df = load_data_ultra_fos()
     
+    # PageRank עם Alpha גבוה לשמירה על הפיצ'רים המשוקללים
     aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
     x_smooth, _ = aggregator(features, adj._indices())
     
+    # מודל לורנציאני בממד גבוה
     model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, 
                  drop_out=0.0, use_bias=True).to(device)
     model.eval()
@@ -79,7 +80,8 @@ def main():
     with torch.no_grad():
         embeddings = model(x_smooth).cpu().numpy()
         
-    clf = IsolationForest(contamination='auto', random_state=args.seed)
+    # זיהוי אנומליות
+    clf = IsolationForest(contamination='auto', random_state=args.seed, n_jobs=-1)
     clf.fit(embeddings)
     df['anomaly_score'] = -clf.decision_function(embeddings)
     
@@ -87,15 +89,15 @@ def main():
     num_fakes = df['is_anomaly'].sum()
     top_detected = df_sorted.head(num_fakes)['is_anomaly'].sum()
     
-    print("\n" + "="*50)
-    print(f"Results Summary (Alpha={args.alpha}, FOS Weight={args.fos_weight}):")
-    print(f"Precision@{num_fakes}: {top_detected / num_fakes:.4f} ({top_detected}/{num_fakes})")
+    print("\n" + "="*60)
+    print(f"Results (Alpha={args.alpha}, FOS Weight={args.fos_weight}, Dim={args.embedding_dim}):")
+    print(f"Detected {top_detected} / {num_fakes} fakes in Top {num_fakes} (Precision: {top_detected/num_fakes:.4f})")
     
-    print("\nTop 10 Anomalies:")
-    for i, (idx, row) in enumerate(df_sorted.head(10).iterrows()):
+    print("\nTop 15 Anomalies:")
+    for i, (idx, row) in enumerate(df_sorted.head(15).iterrows()):
         src = "[INJECTED]" if row['is_anomaly'] == 1 else "[NATURAL]"
-        print(f"#{i+1} {src} Score: {row['anomaly_score']:.4f} | FOS: {row['fos.name']} | Title: {row['title'][:50]}...")
-    print("="*50)
+        print(f"#{i+1:<2} {src} Score: {row['anomaly_score']:.4f} | FOS: {row['fos.name']:<25} | Title: {row['title'][:45]}...")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
