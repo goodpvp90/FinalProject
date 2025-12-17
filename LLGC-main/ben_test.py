@@ -1,9 +1,7 @@
 import pandas as pd
 import numpy as np
 import networkx as nx
-import scipy.sparse as sp
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
@@ -31,10 +29,9 @@ df["references"] = df["references"].apply(
 )
 
 # =========================================================
-# 2. Build Graph (DIRECTED → UNDIRECTED)
+# 2. Build Graph (UNDIRECTED, CLEAN)
 # =========================================================
 G = nx.Graph()
-
 paper_ids = set(df["id"])
 
 for pid in paper_ids:
@@ -44,6 +41,9 @@ for _, row in df.iterrows():
     for ref in row["references"]:
         if ref in paper_ids:
             G.add_edge(row["id"], ref)
+
+node_list = list(G.nodes())
+id_to_idx = {n: i for i, n in enumerate(node_list)}
 
 print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
@@ -57,8 +57,6 @@ pagerank = nx.pagerank(G, alpha=0.85)
 clustering = nx.clustering(G)
 
 X = []
-node_list = list(G.nodes())
-
 for n in node_list:
     X.append([
         deg.get(n, 0),
@@ -76,53 +74,26 @@ X_tensor = torch.tensor(X, dtype=torch.float32).to(DEVICE)
 print("Feature matrix shape:", X_tensor.shape)
 
 # =========================================================
-# 4. Adjacency Matrix (CONSISTENT)
+# 4. EDGE INDEX (PyG FORMAT)
 # =========================================================
-adj = nx.to_scipy_sparse_array(
-    G,
-    nodelist=node_list,
-    dtype=np.float32
-)
+edges = []
+for u, v in G.edges():
+    edges.append([id_to_idx[u], id_to_idx[v]])
+    edges.append([id_to_idx[v], id_to_idx[u]])
 
-# make sure symmetric + self loops
-adj = adj + adj.T
-adj[adj > 1] = 1
-adj = adj + sp.eye(adj.shape[0])
-
-def normalize_adj(adj):
-    deg = np.array(adj.sum(1)).flatten()
-    deg_inv = np.power(deg, -1)
-    deg_inv[np.isinf(deg_inv)] = 0.0
-    D_inv = sp.diags(deg_inv)
-    return D_inv @ adj
-
-adj_norm = normalize_adj(adj)
-
-def to_torch_sparse(mx):
-    mx = mx.tocoo()
-    indices = torch.from_numpy(
-        np.vstack((mx.row, mx.col)).astype(np.int64)
-    )
-    values = torch.from_numpy(mx.data)
-    shape = torch.Size(mx.shape)
-    return torch.sparse_coo_tensor(indices, values, shape).to(DEVICE)
-
-adj_tensor = to_torch_sparse(adj_norm)
+edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous().to(DEVICE)
 
 # =========================================================
-# 5. Graph Aggregation (PageRankAgg)
+# 5. PageRankAgg (NO MANUAL NORMALIZATION)
 # =========================================================
 sgconv = PageRankAgg(
     K=5,
     alpha=0.1,
-    add_self_loops=False
+    add_self_loops=True,
+    normalize=True
 ).to(DEVICE)
 
-X_gconv, _ = sgconv(
-    X_tensor,
-    adj_tensor._indices(),
-    adj_tensor._values()
-)
+X_gconv, _ = sgconv(X_tensor, edge_index)
 
 # =========================================================
 # 6. Train LLGC (UNSUPERVISED)
@@ -130,12 +101,14 @@ X_gconv, _ = sgconv(
 EMB_DIM = 128
 EPOCHS = 100
 LR = 0.01
+DROP_OUT = 0.0
+USE_BIAS = True
 
 model = LLGC(
-    X_gconv.size(1),
-    EMB_DIM,
-    dropout=0.0,
-    bias=True
+    nfeat=X_gconv.size(1),
+    nclass=EMB_DIM,
+    drop_out=DROP_OUT,
+    use_bias=USE_BIAS
 ).to(DEVICE)
 
 optimizer = optim.Adam(model.parameters(), lr=LR)
@@ -145,7 +118,7 @@ for epoch in range(EPOCHS):
     optimizer.zero_grad()
     Z = model(X_gconv)
 
-    row, col = adj_tensor._indices()
+    row, col = edge_index
     loss = (Z[row] - Z[col]).pow(2).sum(dim=1).mean()
 
     loss.backward()
@@ -154,7 +127,7 @@ for epoch in range(EPOCHS):
 print("Initial training completed")
 
 # =========================================================
-# 7. Anomaly Detection (CORE EXTRACTION)
+# 7. Anomaly Detection
 # =========================================================
 model.eval()
 with torch.no_grad():
@@ -175,13 +148,14 @@ anomalous_nodes = [
 print(f"Detected anomalies: {len(anomalous_nodes)}")
 
 # =========================================================
-# 8. REMOVE ANOMALIES → CORE GRAPH
+# 8. CORE GRAPH (REMOVE ANOMALIES)
 # =========================================================
 df_core = df[~df["id"].isin(anomalous_nodes)].copy()
-
 print(f"Core dataset size: {len(df_core)}")
 
-# rebuild graph
+# =========================================================
+# 9. REBUILD GRAPH + RETRAIN CORE MODEL
+# =========================================================
 G_core = nx.Graph()
 core_ids = set(df_core["id"])
 
@@ -193,52 +167,38 @@ for _, row in df_core.iterrows():
         if ref in core_ids:
             G_core.add_edge(row["id"], ref)
 
-# =========================================================
-# 9. RE-TRAIN ON CORE
-# =========================================================
 node_list_core = list(G_core.nodes())
+id_to_idx_core = {n: i for i, n in enumerate(node_list_core)}
 
 deg = dict(G_core.degree())
 pagerank = nx.pagerank(G_core)
 clustering = nx.clustering(G_core)
 
-X_core = []
+Xc = []
 for n in node_list_core:
-    X_core.append([
+    Xc.append([
         deg.get(n, 0),
         pagerank.get(n, 0),
         clustering.get(n, 0)
     ])
 
-X_core = scaler.fit_transform(
-    np.array(X_core, dtype=np.float32)
-)
+Xc = scaler.fit_transform(np.array(Xc, dtype=np.float32))
+Xc = torch.tensor(Xc, dtype=torch.float32).to(DEVICE)
 
-X_core = torch.tensor(X_core).to(DEVICE)
+edges_core = []
+for u, v in G_core.edges():
+    edges_core.append([id_to_idx_core[u], id_to_idx_core[v]])
+    edges_core.append([id_to_idx_core[v], id_to_idx_core[u]])
 
-adj_core = nx.to_scipy_sparse_array(
-    G_core,
-    nodelist=node_list_core,
-    dtype=np.float32
-)
-adj_core = adj_core + adj_core.T
-adj_core[adj_core > 1] = 1
-adj_core = adj_core + sp.eye(adj_core.shape[0])
+edge_index_core = torch.tensor(edges_core, dtype=torch.long).t().contiguous().to(DEVICE)
 
-adj_core = normalize_adj(adj_core)
-adj_core = to_torch_sparse(adj_core)
-
-X_gconv_core, _ = sgconv(
-    X_core,
-    adj_core._indices(),
-    adj_core._values()
-)
+Xc_gconv, _ = sgconv(Xc, edge_index_core)
 
 model_core = LLGC(
-    X_gconv_core.size(1),
-    EMB_DIM,
-    0.0,
-    True
+    nfeat=Xc_gconv.size(1),
+    nclass=EMB_DIM,
+    drop_out=DROP_OUT,
+    use_bias=USE_BIAS
 ).to(DEVICE)
 
 optimizer = optim.Adam(model_core.parameters(), lr=LR)
@@ -246,10 +206,10 @@ optimizer = optim.Adam(model_core.parameters(), lr=LR)
 model_core.train()
 for epoch in range(EPOCHS):
     optimizer.zero_grad()
-    Zc = model_core(X_gconv_core)
-    r, c = adj_core._indices()
+    Zc = model_core(Xc_gconv)
+    r, c = edge_index_core
     loss = (Zc[r] - Zc[c]).pow(2).sum(dim=1).mean()
     loss.backward()
     optimizer.step()
 
-print("Core model ready")
+print("✔ Core model ready")
