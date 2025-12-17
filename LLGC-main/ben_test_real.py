@@ -11,19 +11,17 @@ from sklearn.ensemble import IsolationForest
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
-# הגדרת פרמטרים
 parser = argparse.ArgumentParser()
 parser.add_argument('--embedding_dim', type=int, default=64)
 parser.add_argument('--K', type=int, default=10)
-parser.add_argument('--alpha', type=float, default=0.8, help='Alpha גבוה שומר על סיגנל האנומליה')
+parser.add_argument('--alpha', type=float, default=0.8)
 parser.add_argument('--seed', type=int, default=42)
 args = parser.parse_args()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def load_and_inject():
-    print("Loading data and injecting anomalies...")
-    # טעינת הדאטאסט המקורי והמזויפים
+def main():
+    print("Loading and preparing data...")
     df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
     df_fakes = pd.read_csv("fakes.csv")
     
@@ -35,7 +33,7 @@ def load_and_inject():
     node_ids = df['id'].tolist()
     node_to_idx = {node_id: i for i, node_id in enumerate(node_ids)}
     
-    # בניית הגרף (Edges)
+    # בניית הגרף
     G = nx.Graph()
     G.add_nodes_from(node_ids)
     for _, row in df.iterrows():
@@ -46,63 +44,53 @@ def load_and_inject():
                     G.add_edge(row['id'], str(ref))
         except: continue
 
-    # הפקת פיצ'רים טקסטואליים
+    # פיצ'רים טקסטואליים והזרקת רעש
     df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
     vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
     tfidf_matrix = vectorizer.fit_transform(df['text']).toarray()
     
-    # הזרקת רעש אקראי למאמרים המזויפים (כפי שנעשה ב-full_pipeline.py)
-    # זה מבטיח שהם יהיו Outliers מובהקים
     for i in range(len(df)):
         if df.iloc[i]['is_anomaly'] == 1:
             tfidf_matrix[i] = np.random.uniform(-1.0, 1.0, 500)
 
     features = torch.FloatTensor(tfidf_matrix).to(device)
     
-    # הכנת מטריצת שכנות
+    # נורמליזציה של הגרף
     adj = nx.adjacency_matrix(G, nodelist=node_ids)
     adj, _ = preprocess_citation(adj, tfidf_matrix, normalization="AugNormAdj")
     adj_tensor = sparse_mx_to_torch_sparse_tensor(adj).to(device)
     
-    return features, adj_tensor, df, len(df_fakes)
-
-def main():
-    # 1. טעינה והזרקה
-    features, adj, df, num_injected = load_and_inject()
-    
-    # 2. PageRank Aggregation (בלי אימון, רק החלקה מבנית)
+    # הרצת המודל
     aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
-    x_smooth, _ = aggregator(features, adj._indices())
+    x_smooth, _ = aggregator(features, adj_tensor._indices())
     
-    # 3. Lorentzian Projection (LLGC) - משקולות רנדומליות לחלוטין
-    model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, 
-                 drop_out=0.0, use_bias=True).to(device)
-    model.eval() # מצב Evaluation (בלי Drop-out)
+    model = LLGC(nfeat=500, nclass=args.embedding_dim, drop_out=0.0, use_bias=True).to(device)
+    model.eval()
     
     with torch.no_grad():
         embeddings = model(x_smooth).cpu().numpy()
         
-    # 4. זיהוי אנומליות בעזרת Isolation Forest
-    print("Running Isolation Forest on random embeddings...")
+    # זיהוי אנומליות
+    print("Detecting anomalies...")
     clf = IsolationForest(contamination='auto', random_state=args.seed)
     clf.fit(embeddings)
     df['anomaly_score'] = -clf.decision_function(embeddings)
     
-    # 5. ניתוח תוצאות
+    # סידור התוצאות
     df_sorted = df.sort_values(by='anomaly_score', ascending=False)
-    top_candidates = df_sorted.head(num_injected)
-    detected = top_candidates['is_anomaly'].sum()
     
-    print("\n" + "="*40)
-    print(f"Results Summary (No Training):")
-    print(f"Precision@{num_injected}: {detected / num_injected:.4f}")
-    print(f"Detected {detected} out of {num_injected} injected fakes.")
-    print("="*40)
+    # --- הפלט לקובץ CSV ---
+    output_filename = "full_anomaly_detection_results.csv"
+    # אנחנו שומרים רק את העמודות הרלוונטיות כדי שהקובץ יהיה קריא
+    columns_to_save = ['id', 'title', 'year', 'is_anomaly', 'anomaly_score']
+    df_sorted[columns_to_save].to_csv(output_filename, index=False)
     
-    print("\nTop 10 Anomaly Candidates:")
-    for i, (idx, row) in enumerate(df_sorted.head(10).iterrows()):
-        label = "[FAKE]" if row['is_anomaly'] == 1 else "[REAL]"
-        print(f"#{i+1} {label} Score: {row['anomaly_score']:.4f} | Title: {row['title'][:60]}...")
+    print(f"\nSuccess! Full results for all {len(df)} nodes saved to: {output_filename}")
+    
+    # הצגת סיכום קצר למסך
+    num_fakes = len(df_fakes)
+    detected = df_sorted.head(num_fakes)['is_anomaly'].sum()
+    print(f"Precision@{num_fakes}: {detected / num_fakes:.4f}")
 
 if __name__ == "__main__":
     main()
