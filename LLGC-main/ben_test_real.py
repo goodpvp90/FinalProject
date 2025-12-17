@@ -89,7 +89,7 @@ def main():
     # 4. PageRank Smoothing (Aggregation)
     # צמתים רגילים "יתערבבו" עם השכנים שלהם ויהפכו לממוצע הקבוצה.
     # צמתים מבודדים (אנומליות) יישארו עם הפיצ'רים המקוריים שלהם, מה שיבליט אותם.
-    aggregator = PageRankAgg(K=args.K, alpha=0.9).to(device)
+    aggregator = PageRankAgg(K=args.K, alpha=0.7).to(device)
     x_smooth, _ = aggregator(features, adj._indices())
     
     # 5. Lorentzian Embedding (LLGC)
