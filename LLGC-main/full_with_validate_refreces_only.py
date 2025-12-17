@@ -24,6 +24,10 @@ random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+# If using newer PyTorch versions:
+# torch.use_deterministic_algorithms(True)
 
 # --------------------------
 # 1. Load & Preprocess Data
@@ -315,7 +319,7 @@ G_clean = nx.DiGraph()
 
 paper_ids_clean = set(df_clean["id"])
 
-for pid in paper_ids_clean:
+for pid in sorted(paper_ids_clean): # Sort to ensure consistent order
     G_clean.add_node(pid)
 
 for _, row in df_clean.iterrows():
