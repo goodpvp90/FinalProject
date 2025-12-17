@@ -21,8 +21,7 @@ args = parser.parse_args()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_and_inject_anomalies():
-    print("Loading data...")
-    # טעינת המאמרים האמיתיים והמזויפים
+    print("Loading data and analyzing context...")
     df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
     df_fakes = pd.read_csv("fakes.csv")
     
@@ -34,7 +33,6 @@ def load_and_inject_anomalies():
     node_ids = df['id'].tolist()
     node_to_idx = {node_id: i for i, node_id in enumerate(node_ids)}
     
-    # 1. בניית הגרף (זיהוי קשרים)
     G = nx.Graph()
     G.add_nodes_from(node_ids)
     for _, row in df.iterrows():
@@ -45,30 +43,37 @@ def load_and_inject_anomalies():
                     G.add_edge(row['id'], str(ref))
         except: continue
 
-    # 2. הפקת פיצ'רים טקסטואליים (TF-IDF)
-    # אנחנו לא דוחפים ערכים מוגזמים, אלא נותנים ל-TF-IDF לעשות את שלו
+    # 1. שיפור ה-TF-IDF: נגדיל את כמות המילים ונשתמש ב-N-grams
+    # זה קריטי כדי שהמילים של ה-fakes ייכללו בוקטור
     df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
-    vectorizer = TfidfVectorizer(max_features=500, stop_words='english')
+    vectorizer = TfidfVectorizer(
+        max_features=2000, # הגדלה משמעותית
+        stop_words='english',
+        ngram_range=(1, 2) # זיהוי ביטויים
+    )
     tfidf_matrix = vectorizer.fit_transform(df['text']).toarray()
     
-    # 3. הוספת פיצ'ר מבני: דרגת הצומת (Degree) - קריטי לזיהוי אנומליה ללא רעש
-    # צמתים מזויפים הם לרוב מבודדים בגרף הציטוטים
+    # 2. נרמול לוגריתמי של הדרגה (Degree)
+    # זה מונע ממאמרים עם המון ציטוטים להשתלט על הניקוד
     degrees = np.array([G.degree(n) for n in node_ids]).reshape(-1, 1)
-    # נרמול הדרגה כדי שתהיה בטווח של הפיצ'רים האחרים (0 עד 1)
-    if degrees.max() > 0:
-        degrees = degrees / degrees.max()
+    log_degrees = np.log1p(degrees) 
+    if log_degrees.max() > 0:
+        log_degrees = log_degrees / log_degrees.max()
     
-    # שילוב הדרגה עם ה-TF-IDF
-    combined_features = np.hstack([tfidf_matrix, degrees])
+    # 3. שקלול: ניתן יותר משקל לטקסט מאשר למבנה
+    # כדי שהתוכן הזר ("baking") ינצח את העובדה שהמאמר מבודד
+    combined_features = np.hstack([tfidf_matrix * 2.0, log_degrees])
     
     features_tensor = torch.FloatTensor(combined_features).to(device)
     
-    # הכנת מטריצת שכנות לנרמול (AugNormAdj)
     adj = nx.adjacency_matrix(G, nodelist=node_ids)
     adj, _ = preprocess_citation(adj, combined_features, normalization="AugNormAdj")
     adj_tensor = sparse_mx_to_torch_sparse_tensor(adj).to(device)
     
     return features_tensor, adj_tensor, df, len(df_fakes)
+
+# ב-main, כדאי לשחק עם ה-Alpha של PageRank
+# Alpha נמוך (0.1) = יותרSmoothing (המאמרים האמיתיים נהיים דומים אחד לשני, הזרים בולטים)
 
 def main():
     features, adj, df, num_injected = load_and_inject_anomalies()
