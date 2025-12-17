@@ -377,7 +377,7 @@ print("\n" + "="*70)
 print("Injecting Synthetic Nodes (5% new, 2-7 random connections each)")
 print("="*70)
 
-df = inject_synthetic_nodes_from_csv(df, fakes_csv="C:\\Users\\nadir\\FinalProject\\LLGC-main\\fakes.csv")
+df = inject_synthetic_nodes_from_csv(df, fakes_csv="fakes.csv")
 print(f"New dataframe size after injection: {len(df)} rows")
 
 # ---------------------------------------------------------
