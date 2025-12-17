@@ -17,6 +17,18 @@ import random
 
 from model import LLGC, PageRankAgg
 
+# פונקציית עזר לעיבוד רשימות ציטוטים בצורה חסינה (מונעת SyntaxError)
+def parse_ref_list(x):
+    """מפרקת מחרוזות של רשימות כמו "['id1', 'id2']" או "[id1, id2]" בצורה בטוחה."""
+    if pd.isna(x) or str(x).strip() == '[]' or not str(x).strip():
+        return []
+    s = str(x).strip()
+    # הסרת סוגריים מרובעים אם הם קיימים
+    if s.startswith('[') and s.endswith(']'):
+        s = s[1:-1]
+    # פיצול לפי פסיק וניקוי מירכאות ורווחים מכל מזהה
+    return [item.strip().strip("'").strip('"') for item in s.split(',') if item.strip()]
+
 # --------------------------
 # 0. Set random seeds for reproducibility
 # --------------------------
@@ -36,8 +48,8 @@ file_name = "final_filtered_by_fos_and_reference.csv"
 print(f"Loading data from: {file_name}")
 df = pd.read_csv(file_name)
 
-# Convert 'references' string representation of list into actual Python list
-df['references'] = df['references'].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else [])
+# שימוש בפורסר החדש כדי להימנע מטעויות תחביר בגלל מזהים לא עטופים במירכאות
+df['references'] = df['references'].apply(parse_ref_list)
 
 # --------------------------
 # 2. Build Graph
@@ -65,12 +77,12 @@ for _, row in df.iterrows():
 # --------------------------
 print("Building features...")
 
-# --- תיקון: שימוש בטקסט אמיתי במקום רעש אקראי כדי לאפשר למודל ללמוד תבניות ---
+# שימוש בטקסט אמיתי (TF-IDF) במקום רעש אקראי כדי שהמודל יוכל לזהות חריגות בתוכן
 df['text_combined'] = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
-vectorizer = TfidfVectorizer(stop_words='english', max_features=1000) # צמצום ל-1000 לצורך יציבות
+vectorizer = TfidfVectorizer(stop_words='english', max_features=1000) 
 X_static = vectorizer.fit_transform(df['text_combined']).toarray().astype(np.float32)
 
-# # הקוד המקורי שלך (נשמר כקומנט לבקשתך):
+# # הקוד המקורי (רעש אקראי) נשמר כקומנט:
 # num_nodes = len(df)
 # structure_dim = 128  
 # X_static = np.random.randn(num_nodes, structure_dim).astype(np.float32)
@@ -78,7 +90,7 @@ X_static = vectorizer.fit_transform(df['text_combined']).toarray().astype(np.flo
 print(f"Final feature matrix shape: {X_static.shape}")
 
 # # --------------------------
-# # 3. Feature Extraction (Additional metadata - original comments)
+# # 3. Feature Extraction (Metadata - Original Comments)
 # # --------------------------
 # # Numerical features (citations, year)
 # numerical_features = df[['n_citation', 'year']].copy()
@@ -179,15 +191,13 @@ def run_anomaly_detection(embeddings, contamination_rate):
     scores = clf.decision_function(embeddings)
     return scores, anomalies
 
-import copy
-
 def inject_synthetic_nodes_from_csv(df, fakes_csv="fakes.csv"):
     df = df.copy()
     df_fake = pd.read_csv(fakes_csv)
 
-    # --- תיקון חשוב: המרת רשימת הציטוטים של המזויפים ממחרוזת לרשימה ---
+    # שימוש בפורסר חסין גם כאן כדי למנוע את ה-SyntaxError שחווית
     if 'references' in df_fake.columns:
-        df_fake['references'] = df_fake['references'].apply(lambda x: ast.literal_eval(x) if (isinstance(x, str) and x.startswith('[')) else [])
+        df_fake['references'] = df_fake['references'].apply(parse_ref_list)
 
     if 'is_synthetic' not in df_fake.columns:
         df_fake['is_synthetic'] = True
@@ -313,7 +323,7 @@ model_clean = train_unsupervised_with_prior(
 model_clean.eval()
 Z_clean = model_clean(X_gconv_clean).detach().cpu()
 
-# Update globals
+# עדכון המשתנים הגלובליים להמשך
 df = df_clean
 G = G_clean
 X_tensor = X_clean
@@ -340,7 +350,7 @@ print("="*70)
 new_idx_map = {pid: i for i, pid in enumerate(df['id'])}
 N = len(df)
 
-# --- תיקון: שימוש באותו וקטורייזר מהאימון כדי שהממדים יתאימו למודל ---
+# שימוש באותו Vectorizer שהתאמן על הדאטה האמיתי לצורך עקביות
 texts = (df['title'].fillna('') + ' ' + df['abstract'].fillna('')).tolist()
 X_full_new = torch.tensor(vectorizer.transform(texts).toarray(), dtype=torch.float32).to(DEVICE)
 
@@ -349,7 +359,6 @@ for i, refs in enumerate(df['references']):
     if isinstance(refs, list):
         for ref in refs:
             if ref in new_idx_map:
-                # יצירת קשרים דו-כיווניים כפי שהיה בקוד המקורי
                 rows_new += [i, new_idx_map[ref]]
                 cols_new += [new_idx_map[ref], i]
 
@@ -369,7 +378,7 @@ with torch.no_grad():
 fake_mask = df['is_synthetic'].fillna(False).astype(bool).values
 fake_indices = np.where(fake_mask)[0]
 
-# --- תיקון: העלאת ה-Contamination ל-0.05 כי הזרקנו כמות גדולה של זיופים ---
+# העלאת ה-contamination ל-0.05 כדי לאפשר למודל "למצוא" את הזיופים שהוזרקו
 contamination = 0.05
 scores_new, pred_new = run_anomaly_detection(Z_new, contamination_rate=contamination)
 
