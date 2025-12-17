@@ -101,7 +101,7 @@ def main():
     
     # 4. PageRank Smoothing (Aggregation)
     # alpha נמוך (0.15) כפי שהוגדר בפרמטרים
-    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
+    aggregator = PageRankAgg(K=args.K, alpha=0.8).to(device)
     x_smooth, _ = aggregator(features, adj._indices())
     
     # 5. Lorentzian Embedding (LLGC)
