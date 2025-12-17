@@ -4,12 +4,26 @@ import numpy as np
 import torch
 import networkx as nx
 import ast
+import random # נוסף לצורך קיבוע הזרע
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
 
 # ייבוא הרכיבים מהקבצים הקיימים ב-repo
 from model import LLGC, PageRankAgg
 from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
+
+# פונקציה להבטחת דטרמיניזם (תוצאות קבועות)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # הבטחת דטרמיניזם בפעולות GPU (עלול להאט מעט את הביצועים)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"Deterministic mode enabled with seed: {seed}")
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--embedding_dim', type=int, default=64)
@@ -43,19 +57,18 @@ def load_and_inject_anomalies():
                     G.add_edge(row['id'], str(ref))
         except: continue
 
-    # א. TF-IDF משופר: רגישות גבוהה למילים נדירות
+    # א. TF-IDF משופר
     df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
     vectorizer = TfidfVectorizer(
         max_features=1500, 
         stop_words='english',
-        min_df=1,          # אל תזרוק מילים שמופיעות רק ב-fakes
+        min_df=1,
         use_idf=True, 
         smooth_idf=True
     )
     tfidf_matrix = vectorizer.fit_transform(df['text']).toarray()
     
-    # ב. הוספת תכונת "צפיפות סמנטית" 
-    # מאמרים מזויפים על נושאים זרים יקבלו ערכים נמוכים מאוד במילים הנפוצות של CS
+    # ב. צפיפות סמנטית
     semantic_density = np.sum(tfidf_matrix, axis=1).reshape(-1, 1)
     
     # ג. נרמול לוגריתמי של הדרגה
@@ -64,10 +77,10 @@ def load_and_inject_anomalies():
     if log_degrees.max() > 0:
         log_degrees = log_degrees / log_degrees.max()
     
-    # שילוב התכונות: טקסט (דומיננטי) + מבנה + צפיפות
+    # שילוב תכונות
     combined_features = np.hstack([tfidf_matrix, log_degrees, semantic_density])
     
-    # נרמול סופי כדי שכל שורה תהיה באותה סקאלה (חשוב ל-LLGC)
+    # נרמול שורות
     row_norms = np.linalg.norm(combined_features, axis=1, keepdims=True)
     row_norms[row_norms == 0] = 1.0
     combined_features = combined_features / row_norms
@@ -80,29 +93,27 @@ def load_and_inject_anomalies():
     
     return features_tensor, adj_tensor, df, len(df_fakes)
 
-# ב-main, כדאי לשחק עם ה-Alpha של PageRank
-# Alpha נמוך (0.1) = יותרSmoothing (המאמרים האמיתיים נהיים דומים אחד לשני, הזרים בולטים)
-
 def main():
+    # קריאה לפונקציית קיבוע הזרע בתחילת הריצה
+    set_seed(args.seed)
+    
     features, adj, df, num_injected = load_and_inject_anomalies()
     
     # 4. PageRank Smoothing (Aggregation)
-    # צמתים רגילים "יתערבבו" עם השכנים שלהם ויהפכו לממוצע הקבוצה.
-    # צמתים מבודדים (אנומליות) יישארו עם הפיצ'רים המקוריים שלהם, מה שיבליט אותם.
-    aggregator = PageRankAgg(K=args.K, alpha=0.8).to(device)
+    # alpha נמוך (0.15) כפי שהוגדר בפרמטרים
+    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
     x_smooth, _ = aggregator(features, adj._indices())
     
     # 5. Lorentzian Embedding (LLGC)
-    # המודל משליך את הנתונים למרחב היפרבולי, שטוב במיוחד לזיהוי היררכיות וחריגות.
+    # המשקולות של LorentzLinear יאותחלו כעת בצורה זהה בכל הרצה בזכות ה-set_seed
     model = LLGC(nfeat=features.size(1), nclass=args.embedding_dim, 
                   drop_out=0.0, use_bias=True).to(device)
     model.eval()
     
     with torch.no_grad():
-        # ההטמעה (Embedding) תדגיש את המרחק של האנומליות מהמרכז
         embeddings = model(x_smooth).cpu().numpy()
         
-    # 6. Isolation Forest - זיהוי ה-Outliers במרחב ההטמעה
+    # 6. Isolation Forest
     clf = IsolationForest(contamination='auto', random_state=args.seed)
     clf.fit(embeddings)
     df['anomaly_score'] = -clf.decision_function(embeddings)
