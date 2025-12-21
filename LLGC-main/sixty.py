@@ -106,31 +106,6 @@ def build_structural_features(G, id_to_idx):
 X = build_structural_features(G, id_to_idx)
 X = torch.tensor(X, dtype=torch.float32).to(DEVICE)
 
-
-def safe_parse_references(x):
-    """
-    Safely parse references field.
-    Returns a list or empty list.
-    """
-    if isinstance(x, list):
-        return x
-
-    if not isinstance(x, str):
-        return []
-
-    x = x.strip()
-
-    # empty or invalid
-    if len(x) == 0 or x[0] != '[' or x[-1] != ']':
-        return []
-
-    try:
-        parsed = ast.literal_eval(x)
-        return parsed if isinstance(parsed, list) else []
-    except Exception:
-        return []
-
-
 # ======================================================
 # 6. Adjacency Utilities
 # ======================================================
@@ -194,6 +169,29 @@ def train_llgc(model, X, adj_idx, prev_Z=None, epochs=100, lr=0.01):
         opt.step()
 
     return model
+
+def safe_parse_references(x):
+    """
+    Safely parse references field.
+    Returns a list or empty list.
+    """
+    if isinstance(x, list):
+        return x
+
+    if not isinstance(x, str):
+        return []
+
+    x = x.strip()
+
+    # empty or invalid
+    if len(x) == 0 or x[0] != '[' or x[-1] != ']':
+        return []
+
+    try:
+        parsed = ast.literal_eval(x)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
 
 # ======================================================
 # 9. Temporal Training (REAL DATA ONLY)
