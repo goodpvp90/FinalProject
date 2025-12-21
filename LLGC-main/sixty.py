@@ -205,7 +205,7 @@ model.eval()
 with torch.no_grad():
     Z_final = model(X_gconv_aug).cpu().numpy()
 
-contamination = 0.008
+contamination = 0.0065
 clf = IsolationForest(contamination=contamination, random_state=42)
 pred = clf.fit_predict(Z_final)
 
