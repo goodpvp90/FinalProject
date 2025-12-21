@@ -1,409 +1,165 @@
+import argparse
 import pandas as pd
+import numpy as np
+import torch
 import networkx as nx
 import ast
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-import os
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
-import torch
-import scipy.sparse as sp
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from sklearn.ensemble import IsolationForest
-from sklearn.metrics import precision_score, recall_score, f1_score
 import random
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import RobustScaler
+import torch.optim as optim
 
+# ייבוא הרכיבים מהקבצים הקיימים ב-repo
 from model import LLGC, PageRankAgg
+from utils import preprocess_citation, sparse_mx_to_torch_sparse_tensor
 
 # --------------------------
-# 0. Set random seeds for reproducibility
+# 1. הגדרות וקיבוע זרע (Reproducibility)
 # --------------------------
-random.seed(42)
-np.random.seed(42)
-torch.manual_seed(42)
-torch.cuda.manual_seed_all(42)
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-# --------------------------
-# 1. Load & Preprocess Data
-# --------------------------
-file_name = "final_filtered_by_fos_and_reference.csv"
-print(f"Loading data from: {file_name}")
-df = pd.read_csv(file_name)
+parser = argparse.ArgumentParser()
+parser.add_argument('--embedding_dim', type=int, default=128)
+parser.add_argument('--K', type=int, default=10)
+parser.add_argument('--alpha', type=float, default=0.1, help='Low alpha for better smoothing of real nodes')
+parser.add_argument('--seed', type=int, default=42)
+parser.add_argument('--epochs', type=int, default=100)
+args = parser.parse_args()
 
-# Convert 'references' string representation of list into actual Python list
-df['references'] = df['references'].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else [])
-
-# --------------------------
-# 2. Build Graph
-# --------------------------
-G = nx.DiGraph()  # directed
-#G = nx.Graph()  # undirected graph
-
-paper_ids = set(df['id'])
-
-# Add nodes with attributes (excluding textual/graph-specific fields)
-for _, row in df.iterrows():
-    paper_id = row['id']
-    attributes = row.drop(['id','title','authors.name','year','fos.name','n_citation','references','abstract']).to_dict()
-    G.add_node(paper_id, **attributes)
-
-# Add edges based on citations (references)
-for _, row in df.iterrows():
-    citing_paper_id = row['id']
-    for cited_paper_id in row['references']:
-        if cited_paper_id in paper_ids:
-            G.add_edge(citing_paper_id, cited_paper_id)
+set_seed(args.seed)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --------------------------
-# 3. Feature Extraction (STRUCTURE ONLY)
+# 2. טעינה והזרקת אנומליות בצורה חכמה
 # --------------------------
-print("Building STRUCTURE ONLY features (ignoring text/metadata)...")
-
-# במקום לחשב TF-IDF ונתונים  מספריים, ניצור וקטורים אקראיים.
-# המידע היחיד שהמודל יקבל הוא המבנה של הגרף שיעובד דרך ה-PageRankAgg.
-
-num_nodes = len(df)
-structure_dim = 128  # גודל הוקטור לכל מאמר. אפשר לשחק עם זה (64, 128, 256)
-
-# יצירת פיצ'רים אקראיים מהתפלגות נורמלית
-X_static = np.random.randn(num_nodes, structure_dim).astype(np.float32)
-
-print(f"Final STRUCTURE-ONLY feature matrix shape: {X_static.shape}")
-
-# # --------------------------
-# # 3. Feature Extraction
-# # --------------------------
-# # Combine title + abstract for textual features
-# df['text_combined'] = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
-# vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
-# X_text = vectorizer.fit_transform(df['text_combined']).toarray()  # TF-IDF features
-#
-# # Numerical features (citations, year)
-# numerical_features = df[['n_citation', 'year']].copy()
-# scaler = StandardScaler()
-# X_numerical = scaler.fit_transform(numerical_features)
-#
-# # One-hot encode field-of-study (fos.name)
-# fos_encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-# X_fos = fos_encoder.fit_transform(df[['fos.name']].fillna('Unknown'))
-#
-# # Number of authors as numerical feature
-# df['num_authors'] = df['authors.name'].apply(lambda x: len(ast.literal_eval(x)) if pd.notna(x) and x != '[]' else 1)
-# X_authors = scaler.fit_transform(df[['num_authors']])
-#
-# # Combine all static features into one matrix
-# X_static = np.hstack((X_text, X_numerical, X_fos, X_authors))
-# print(f"Final static feature matrix shape: {X_static.shape}")
-# --------------------------
-# 4. Graph Matrices & Tensor Setup
-# --------------------------
-# Map between node IDs and integer indices
-idx_to_id = {i: node_id for i, node_id in enumerate(G.nodes())}
-id_to_idx = {node_id: i for i, node_id in enumerate(G.nodes())}
-
-# Convert edges to index-based representation for adjacency matrix
-edges = [(id_to_idx[u], id_to_idx[v]) for u, v in G.edges()]
-N = G.number_of_nodes()
-rows = [u for u, v in edges]
-cols = [v for u, v in edges]
-data = np.ones(len(edges))
-
-# Create sparse adjacency matrix
-adj_matrix = sp.coo_matrix((data, (rows, cols)), shape=(N, N), dtype=np.float32)
-adj_matrix_sliceable = adj_matrix.tocsr()
-
-# Symmetric normalization of adjacency matrix
-def normalize_adj_sym(adj):
-    # Make adjacency symmetric
-    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-    adj_hat = adj + sp.eye(adj.shape[0])
-    rowsum = np.array(adj_hat.sum(1))
-    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
-    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-    return adj_hat.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
-
-# Convert sparse matrix to PyTorch sparse tensor
-def sparse_to_torch_sparse(sparse_mx):
-    sparse_mx = sparse_mx.tocoo().astype(np.float32)
-    indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
-    values = torch.from_numpy(sparse_mx.data)
-    shape = torch.Size(sparse_mx.shape)
-    return torch.sparse_coo_tensor(indices, values, shape)
-
-# Convert static features to torch tensor
-X_tensor = torch.FloatTensor(X_static)
+def load_and_prepare_data():
+    print("Loading original and fake data...")
+    df_real = pd.read_csv("final_filtered_by_fos_and_reference.csv")
+    df_fakes = pd.read_csv("fakes.csv")
+    
+    df_real['is_synthetic'] = False
+    df_fakes['is_synthetic'] = True
+    
+    # איחוד דאטה-סטים
+    df = pd.concat([df_real, df_fakes], ignore_index=True)
+    df['id'] = df['id'].astype(str)
+    df['references'] = df['references'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else [])
+    
+    node_ids = df['id'].tolist()
+    node_to_idx = {node_id: i for i, node_id in enumerate(node_ids)}
+    
+    # בניית הגרף
+    G = nx.Graph()
+    G.add_nodes_from(node_ids)
+    for i, row in df.iterrows():
+        for ref in row['references']:
+            if str(ref) in node_to_idx:
+                G.add_edge(row['id'], str(ref))
+    
+    print(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")
+    return df, G, node_ids
 
 # --------------------------
-# 5. Temporal Segmentation
+# 3. הנדסת תכונות היברידית (Text + Structure)
 # --------------------------
-DELTA_T = 61
-years = df['year'].dropna().astype(int)
-min_year = years.min()
-max_year = years.max()
-time_steps = list(range(min_year, max_year + DELTA_T, DELTA_T))
-
-# Split nodes into temporal segments
-temporal_segments = {}
-for i in range(len(time_steps)-1):
-    t_start = time_steps[i]
-    t_end = time_steps[i+1]
-    current_segment_df = df[df['year'] <= t_end]
-    node_indices_in_segment = [id_to_idx[id] for id in current_segment_df['id'] if id in id_to_idx]
-    temporal_segments[(t_start, t_end)] = node_indices_in_segment
-
-print(f"Total segments created: {len(temporal_segments)}")
+def extract_hybrid_features(df, G, node_ids):
+    print("Extracting hybrid features (TF-IDF + Structural Priors)...")
+    
+    # א. טקסט: TF-IDF עם הגדרות לניטרול אורך (Sublinear TF)
+    df['text'] = df['title'].fillna('') + " " + df['abstract'].fillna('')
+    vectorizer = TfidfVectorizer(max_features=1500, stop_words='english', sublinear_tf=True)
+    X_text = vectorizer.fit_transform(df['text']).toarray()
+    
+    # ב. מבנה: Log-Degree עם Robust Scaling לנטרול Hubs
+    degrees = np.array([G.degree(n) for n in node_ids]).reshape(-1, 1)
+    scaler = RobustScaler()
+    X_struct = scaler.fit_transform(np.log1p(degrees))
+    
+    # ג. איחוד וקיבוע נרמול שורות
+    X_combined = np.hstack([X_text * 2.0, X_struct]) # משקל גבוה יותר לטקסט
+    row_norms = np.linalg.norm(X_combined, axis=1, keepdims=True)
+    X_combined = X_combined / (row_norms + 1e-9)
+    
+    return torch.FloatTensor(X_combined).to(device)
 
 # --------------------------
-# 6. Helper Functions
+# 4. פונקציית אימון (Unsupervised)
 # --------------------------
-def train_unsupervised_with_prior(model, X_features, adj_indices, prev_embeddings=None,
-                                  epochs=100, lr=0.01, device='cpu', temporal_weight=0.5):
-    """
-    Train LLGC model in unsupervised manner with optional temporal regularization.
-    - X_features: node features
-    - adj_indices: adjacency indices for reconstruction loss
-    - prev_embeddings: embeddings from previous time step (optional)
-    """
+def train_model(model, features, adj_indices, epochs=100):
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    X_features = X_features.to(device)
-
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
     for epoch in range(epochs):
         optimizer.zero_grad()
-        Z = model(X_features)
+        Z = model(features)
+        # Adjacency Reconstruction Loss
         row, col = adj_indices
-        loss = (Z[row] - Z[col]).pow(2).sum(dim=1).mean()  # adjacency reconstruction loss
-        if prev_embeddings is not None:
-            prev_embeddings = prev_embeddings.to(device)
-            common_nodes = min(Z.size(0), prev_embeddings.size(0))
-            temporal_loss = (Z[:common_nodes] - prev_embeddings[:common_nodes]).pow(2).mean()
-            loss += temporal_weight * temporal_loss
+        loss = (Z[row] - Z[col]).pow(2).sum(dim=1).mean()
         loss.backward()
         optimizer.step()
+        if epoch % 20 == 0:
+            print(f"Epoch {epoch} | Loss: {loss.item():.4f}")
     return model
 
-def run_anomaly_detection(embeddings, contamination_rate):
-    """
-    Run IsolationForest to detect anomalies on embeddings.
-    Returns anomaly scores and predicted labels (-1 for anomaly, 1 for normal)
-    """
-    clf = IsolationForest(contamination=contamination_rate, random_state=42)
+# --------------------------
+# 5. הרצה מרכזית
+# --------------------------
+def main():
+    df, G, node_ids = load_and_prepare_data()
+    X_tensor = extract_hybrid_features(df, G, node_ids)
+    
+    # הכנת מטריצת שכנות
+    adj = nx.adjacency_matrix(G, nodelist=node_ids)
+    adj_norm, _ = preprocess_citation(adj, X_tensor.cpu().numpy(), normalization="AugNormAdj")
+    adj_tensor = sparse_mx_to_torch_sparse_tensor(adj_norm).to(device)
+    
+    # אגריגציה (Smoothing) - Alpha נמוך הוא המפתח!
+    aggregator = PageRankAgg(K=args.K, alpha=args.alpha).to(device)
+    X_smooth, _ = aggregator(X_tensor, adj_tensor._indices())
+    
+    # מודל לורנציאני
+    model = LLGC(nfeat=X_tensor.size(1), nclass=args.embedding_dim, 
+                  drop_out=0.0, use_bias=True).to(device)
+    
+    # אימון על כל הגרף (כולל הזיופים, בצורה לא מונחית)
+    model = train_model(model, X_smooth, adj_tensor._indices(), epochs=args.epochs)
+    
+    model.eval()
+    with torch.no_grad():
+        embeddings = model(X_smooth).cpu().numpy()
+    
+    # זיהוי אנומליות - כיול לפי 5% (שיעור ה-fakes המשוער)
+    contamination = 0.05 
+    clf = IsolationForest(contamination=contamination, random_state=args.seed, n_estimators=200)
     clf.fit(embeddings)
-    anomalies = clf.predict(embeddings)
-    scores = clf.decision_function(embeddings)
-    return scores, anomalies
+    
+    df['anomaly_score'] = -clf.decision_function(embeddings)
+    df['prediction'] = clf.predict(embeddings) # -1 לאנומליה
+    
+    # הערכה
+    fakes_mask = df['is_synthetic'] == True
+    num_fakes = fakes_mask.sum()
+    detected_fakes = df[fakes_mask & (df['prediction'] == -1)].shape[0]
+    
+    print("\n" + "="*50)
+    print(f"DETECTION RESULTS")
+    print(f"Detected {detected_fakes} out of {num_fakes} fakes.")
+    print(f"Precision@{num_fakes}: {detected_fakes / num_fakes:.4f}")
+    print("="*50)
+    
+    # הצגת הטופ 10
+    print("\nTop 10 Most Anomalous Papers Found:")
+    top_10 = df.sort_values(by='anomaly_score', ascending=False).head(10)
+    for i, (idx, row) in enumerate(top_10.iterrows()):
+        label = "[FAKE]" if row['is_synthetic'] else "[REAL]"
+        print(f"#{i+1} {label} Score: {row['anomaly_score']:.4f} | Title: {row['title'][:70]}...")
 
-import copy
-
-def inject_synthetic_nodes_from_csv(df, fakes_csv="fakes.csv"):
-    """
-    Inject synthetic rows into the dataframe from an existing CSV file.
-    Assumes fakes_csv has the same columns as df and includes 'is_synthetic' column.
-    """
-    df = df.copy()
-
-    # Load synthetic nodes from CSV
-    df_fake = pd.read_csv(fakes_csv)
-
-    # Ensure 'is_synthetic' column exists
-    if 'is_synthetic' not in df_fake.columns:
-        df_fake['is_synthetic'] = True
-
-    # Merge with original dataframe
-    df_final = pd.concat([df, df_fake], ignore_index=True)
-
-    print(f"[Injection] Synthetic nodes from {fakes_csv} successfully added.")
-    print(f"Final dataframe shape: {df_final.shape}")  # number of rows and columns
-
-    # Save to new CSV
-    df_final.to_csv("augmented_dataset.csv", index=False)
-    print(df_final.tail())  # prints the last 5 rows by default
-
-    return df_final
-
-# --------------------------
-# 7. Parameters & Setup
-# --------------------------
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-K_PROP = 5
-ALPHA = 0.1
-DROP_OUT = 0.0
-USE_BIAS = 1
-EPOCHS = 100
-LR = 0.01
-EMBEDDING_DIM = 256
-
-X_tensor = X_tensor.to(DEVICE)
-all_results_rows = []
-prev_Z_t = None
-
-print("\n" + "="*70)
-print(f"Starting Real Temporal Execution (No Synthetic Injection)")
-print("="*70)
-
-# --------------------------
-# 8. MAIN LOOP (REAL DATA ONLY)
-# --------------------------
-
-for (t_start, t_end), global_indices in temporal_segments.items():
-    if not global_indices:
-        continue
-
-    X_t = X_tensor[global_indices]
-    global_indices_np = np.array(global_indices)
-
-    adj_segment = adj_matrix_sliceable[
-        global_indices_np[:, None],
-        global_indices_np
-    ]
-
-    # Normalize adjacency and convert to torch sparse tensor
-    adj_norm_real = normalize_adj_sym(adj_segment)
-    adj_tensor_real = sparse_to_torch_sparse(adj_norm_real).to(DEVICE)
-
-    # Apply PageRank-based aggregation (SGConv)
-    sgconv = PageRankAgg(
-        K=K_PROP,
-        alpha=ALPHA,
-        add_self_loops=False
-    ).to(DEVICE)
-
-    X_gconv_real, _ = sgconv(
-        X_t,
-        adj_tensor_real._indices(),
-        adj_tensor_real._values()
-    )
-
-    # Train LLGC model with optional temporal prior
-    model_real = LLGC(
-        X_gconv_real.size(1),
-        EMBEDDING_DIM,
-        DROP_OUT,
-        USE_BIAS
-    ).to(DEVICE)
-
-    model_real = train_unsupervised_with_prior(
-        model_real,
-        X_gconv_real,
-        adj_tensor_real._indices(),
-        prev_embeddings=prev_Z_t,
-        epochs=EPOCHS,
-        lr=LR,
-        device=DEVICE
-    )
-
-    # Evaluate embeddings and store for next time step
-    model_real.eval()
-    Z_t_real = model_real(X_gconv_real).cpu().detach()
-    prev_Z_t = Z_t_real.clone()
-
-    # Run anomaly detection
-    scores_real, pred_real = run_anomaly_detection(
-        Z_t_real.numpy(),
-        contamination_rate=0.01
-    )
-
-    # Save results
-    for idx, paper_idx in enumerate(global_indices):
-        all_results_rows.append({
-            "paper_id": idx_to_id[paper_idx],
-            "t_start": t_start,
-            "t_end": t_end,
-            "anomaly_score": scores_real[idx],
-            "prediction": pred_real[idx],
-            "is_synthetic": False
-        })
-
-    print(f"Segment [{t_start}-{t_end}] completed (Real Only)")
-
-
-# ---------------------------------------------------------
-# 9. Inject NEW Synthetic Nodes (Feature + Edge Injection)
-# ---------------------------------------------------------
-
-print("\n" + "="*70)
-print("Injecting Synthetic Nodes (5% new, 2-7 random connections each)")
-print("="*70)
-
-df = inject_synthetic_nodes_from_csv(df, fakes_csv="fakes.csv")
-print(f"New dataframe size after injection: {len(df)} rows")
-
-# ---------------------------------------------------------
-# 10. Detect Anomalies on Injected Synthetic Nodes
-# ---------------------------------------------------------
-print("\n" + "="*70)
-print("Running Detection on Injected Synthetic Nodes")
-print("="*70)
-
-# Map paper_id → new index
-new_idx_map = {pid: i for i, pid in enumerate(df['id'])}
-N = len(df)
-
-# Build new feature matrix (TF-IDF only here for simplicity)
-texts = df['abstract'].fillna("").astype(str).tolist()
-vectorizer = TfidfVectorizer(max_features=X_tensor.shape[1])
-X_full_new = torch.tensor(vectorizer.fit_transform(texts).todense(), dtype=torch.float32).to(DEVICE)
-
-# Build adjacency from references (bi-directional)
-rows, cols = [], []
-for i, refs in enumerate(df['references']):
-    if isinstance(refs, list):
-        for ref in refs:
-            if ref in new_idx_map:
-                rows += [i, new_idx_map[ref]]
-                cols += [new_idx_map[ref], i]
-
-adj_new = sp.coo_matrix((np.ones(len(rows)), (rows, cols)),
-                        shape=(N, N), dtype=np.float32)
-
-# Normalize adjacency
-adj_norm_new = normalize_adj_sym(adj_new)
-adj_tensor_new = sparse_to_torch_sparse(adj_norm_new).to(DEVICE)
-
-# Run GCN aggregation
-sgconv_new = PageRankAgg(K=K_PROP, alpha=ALPHA, add_self_loops=False).to(DEVICE)
-X_gconv_new, _ = sgconv_new(X_full_new, adj_tensor_new._indices(), adj_tensor_new._values())
-
-model_real.eval()  # do NOT retrain
-
-with torch.no_grad():
-    Z_new = model_real(X_gconv_new).cpu().numpy()
-
-# Identify synthetic nodes
-fake_mask = df['is_synthetic'].fillna(False).astype(bool).values
-fake_indices = np.where(fake_mask)[0]
-
-# Run anomaly detection
-contamination = 0.01
-scores_new, pred_new = run_anomaly_detection(Z_new, contamination_rate=contamination)
-
-# Save results for synthetic nodes
-detected_count = 0
-for idx in fake_indices:
-    if pred_new[idx] == -1:
-        detected_count += 1
-
-    all_results_rows.append({
-        'paper_id': df.iloc[idx]['id'],
-        't_start': "POST_INJECTION",
-        't_end': "POST_INJECTION",
-        'anomaly_score': scores_new[idx],
-        'prediction': pred_new[idx],
-        'is_synthetic': True
-    })
-
-print(f"\n🔥 Injected Fake Detection Results: {detected_count}/{len(fake_indices)} "
-      f"({detected_count/len(fake_indices):.1%})")
-
-# --------------------------
-# 11. Save Results
-# --------------------------
-out_df = pd.DataFrame(all_results_rows)
-out_df.to_csv("temporal_anomaly_results_real_only.csv", index=False)
-print("\n✅ CSV saved: temporal_anomaly_results_real_only.csv")
-
-
+if __name__ == "__main__":
+    main()
