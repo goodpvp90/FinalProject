@@ -146,6 +146,22 @@ for i in range(len(time_steps)-1):
     with torch.no_grad():
         Z_t = model(X_gconv).cpu()
     
+    # --- ADDED: Record anomaly scores for this temporal segment ---
+    clf_temp = IsolationForest(contamination=0.01, random_state=42)
+    pred_temp = clf_temp.fit_predict(Z_t.numpy())
+    scores_temp = clf_temp.decision_function(Z_t.numpy())
+    
+    for idx, pid in enumerate(current_ids):
+        all_results_rows.append({
+            "paper_id": pid,
+            "t_start": t_start,
+            "t_end": t_end,
+            "anomaly_score": scores_temp[idx],
+            "prediction": pred_temp[idx],
+            "is_synthetic": False
+        })
+    # ---------------------------------------------------------------
+
     for idx, pid in enumerate(current_ids):
         embedding_registry[pid] = Z_t[idx]
 
@@ -192,6 +208,23 @@ with torch.no_grad():
 contamination = 0.006
 clf = IsolationForest(contamination=contamination, random_state=42)
 pred = clf.fit_predict(Z_final)
+
+# --- ADDED: Record final scores after injection ---
+scores_final = clf.decision_function(Z_final)
+for idx, row_data in df_aug.iterrows():
+    all_results_rows.append({
+        "paper_id": row_data['id'],
+        "t_start": "POST_INJECTION",
+        "t_end": "POST_INJECTION",
+        "anomaly_score": scores_final[idx],
+        "prediction": pred[idx],
+        "is_synthetic": row_data.get('is_synthetic', False)
+    })
+
+# Save the final results to a CSV
+pd.DataFrame(all_results_rows).to_csv("temporal_anomaly_results_final.csv", index=False)
+print("\n✅ Results saved to: temporal_anomaly_results_final.csv")
+# -------------------------------------------------
 
 fake_indices = df_aug[df_aug['is_synthetic'] == True].index
 detected = sum(1 for idx in fake_indices if pred[idx] == -1)
