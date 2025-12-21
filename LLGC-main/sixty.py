@@ -105,7 +105,7 @@ def sparse_to_torch_sparse(sparse_mx):
 # --------------------------
 # 4. Temporal Segmentation
 # --------------------------
-DELTA_T = 61
+DELTA_T = 5
 years = df['year'].dropna().astype(int)
 time_steps = list(range(years.min(), years.max() + DELTA_T, DELTA_T))
 
