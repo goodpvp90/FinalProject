@@ -187,7 +187,7 @@ for (t_start, t_end), global_indices in temporal_segments.items():
     print(f"Segment [{t_start}-{t_end}] completed.")
 
 # ---------------------------------------------------------
-# 7. Synthetic Injection & Final Detection (FIX: Consistent Pipeline)
+# 7. Synthetic Injection & Final Detection
 # ---------------------------------------------------------
 print("\n" + "="*50)
 print("Injecting & Detecting Synthetic Nodes")
@@ -231,7 +231,7 @@ with torch.no_grad():
     Z_final = model(X_gconv_aug).cpu().numpy()
 
 # FIX: Set contamination to match (5% injected + 1% baseline)
-contamination = 0.06
+contamination = 0.01
 scores_final, pred_final = run_anomaly_detection(Z_final, contamination_rate=contamination)
 
 # Analyze Synthetic Results
