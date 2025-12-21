@@ -150,7 +150,7 @@ def run_anomaly_detection(embeddings, contamination_rate):
 # --------------------------
 # 6. Main Temporal Loop (Real Data)
 # --------------------------
-K_PROP, ALPHA, EMBEDDING_DIM = 5, 0.1, 256
+K_PROP, ALPHA, EMBEDDING_DIM = 5, 0.8, 128
 all_results_rows = []
 prev_Z_t = None
 
