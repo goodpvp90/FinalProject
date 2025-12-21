@@ -28,7 +28,7 @@ torch.cuda.manual_seed_all(42)
 # --------------------------
 # 1. Load & Preprocess Data
 # --------------------------
-file_name = "C:\\Users\\nadir\\FinalProject\\LLGC-main\\final_filtered_by_fos_and_reference.csv"
+file_name = "final_filtered_by_fos_and_reference.csv"
 print(f"Loading data from: {file_name}")
 df = pd.read_csv(file_name)
 
@@ -198,7 +198,7 @@ def run_anomaly_detection(embeddings, contamination_rate):
 
 import copy
 
-def inject_synthetic_nodes_from_csv(df, fakes_csv="C:\\Users\\nadir\\FinalProject\\LLGC-main\\fakes.csv"):
+def inject_synthetic_nodes_from_csv(df, fakes_csv="fakes.csv"):
     """
     Inject synthetic rows into the dataframe from an existing CSV file.
     Assumes fakes_csv has the same columns as df and includes 'is_synthetic' column.
@@ -329,7 +329,7 @@ print("\n" + "="*70)
 print("Injecting Synthetic Nodes (5% new, 2-7 random connections each)")
 print("="*70)
 
-df = inject_synthetic_nodes_from_csv(df, fakes_csv="C:\\Users\\nadir\\FinalProject\\LLGC-main\\fakes.csv")
+df = inject_synthetic_nodes_from_csv(df, fakes_csv="fakes.csv")
 print(f"New dataframe size after injection: {len(df)} rows")
 
 # ---------------------------------------------------------
