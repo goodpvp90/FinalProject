@@ -69,7 +69,12 @@ def build_structural_features(G, id_to_idx):
     deg_out = dict(G.out_degree())
     pagerank = nx.pagerank(G, alpha=0.85)
     clustering = nx.clustering(G.to_undirected())
-    core = nx.core_number(G.to_undirected())
+
+    # 🔴 FIX: remove self-loops for core number
+    G_simple = G.to_undirected().copy()
+    G_simple.remove_edges_from(nx.selfloop_edges(G_simple))
+    core = nx.core_number(G_simple)
+
     avg_nbr_deg = nx.average_neighbor_degree(G)
 
     X = np.zeros((len(id_to_idx), 8), dtype=np.float32)
@@ -87,6 +92,7 @@ def build_structural_features(G, id_to_idx):
         ]
 
     return StandardScaler().fit_transform(X)
+
 
 X_static = build_structural_features(G, id_to_idx)
 X_tensor = torch.tensor(X_static, dtype=torch.float32).to(DEVICE)
