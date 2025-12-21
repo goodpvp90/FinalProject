@@ -65,7 +65,7 @@ print("Building STRUCTURE ONLY features (ignoring text/metadata)...")
 # המידע היחיד שהמודל יקבל הוא המבנה של הגרף שיעובד דרך ה-PageRankAgg.
 
 num_nodes = len(df)
-structure_dim = 128  # גודל הוקטור לכל מאמר. אפשר לשחק עם זה (64, 128, 256)
+structure_dim = 256  # גודל הוקטור לכל מאמר. אפשר לשחק עם זה (64, 128, 256)
 
 # יצירת פיצ'רים אקראיים מהתפלגות נורמלית
 X_static = np.random.randn(num_nodes, structure_dim).astype(np.float32)
