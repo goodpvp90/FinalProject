@@ -56,7 +56,7 @@ years = df['year'].dropna().astype(int)
 time_steps = list(range(years.min(), years.max() + DELTA_T, DELTA_T))
 
 # --------------------------
-# 4. Updated Training Function (Critical Fixes 2 & 3)
+# 4. Training Function
 # --------------------------
 def train_unsupervised_with_prior(model, X_features, adj_indices, global_indices, 
                                   embedding_registry=None, epochs=100, lr=0.01):
@@ -67,18 +67,16 @@ def train_unsupervised_with_prior(model, X_features, adj_indices, global_indices
         optimizer.zero_grad()
         Z = model(X_features)
         
-        # 1. Adjacency Loss
         row, col = adj_indices
         loss = (Z[row] - Z[col]).pow(2).sum(dim=1).mean()
         
-        # 2. Variance Regularization (Prevents collapse)
+        # Variance Regularization
         std_loss = torch.mean(torch.relu(1.0 - torch.std(Z, dim=0)))
         loss += 0.1 * std_loss
         
-        # 3. Correct Temporal Loss (Match by ID, not index)
+        # Correct Temporal Loss
         if embedding_registry:
             current_ids = [idx_to_id_global[gi] for gi in global_indices]
-            # Find nodes that existed in previous steps
             past_embs = []
             curr_embs = []
             for i, pid in enumerate(current_ids):
@@ -95,25 +93,31 @@ def train_unsupervised_with_prior(model, X_features, adj_indices, global_indices
     return model
 
 # --------------------------
-# 5. Main Loop (Critical Fix 1: No Leakage)
+# 5. Main Loop
 # --------------------------
 K_PROP, ALPHA, EMBEDDING_DIM = 5, 0.8, 128
-embedding_registry = {} # Stores {paper_id: tensor}
+embedding_registry = {} 
 all_results_rows = []
 
 print("\nStarting Temporal Execution...")
 
+def quick_norm(adj):
+    adj = adj + sp.eye(adj.shape[0])
+    rowsum = np.array(adj.sum(1))
+    d_inv = np.power(rowsum, -0.5).flatten()
+    d_inv[np.isinf(d_inv)] = 0.
+    d_mat = sp.diags(d_inv)
+    return d_mat.dot(adj).dot(d_mat).tocoo()
+
 for i in range(len(time_steps)-1):
     t_start, t_end = time_steps[i], time_steps[i+1]
     
-    # מידע שזמין עד הזמן הנוכחי בלבד (נכון מחקרית)
     past_df = df[df['year'] <= t_end].copy()
     current_ids = past_df['id'].tolist()
     global_indices = [id_to_idx_global[pid] for pid in current_ids]
     
     if not global_indices: continue
 
-    # Feature Engineering בתוך הלופ - Fit רק על העבר
     vec = TfidfVectorizer(stop_words='english', max_features=512).fit(past_df['text_combined'])
     scal = StandardScaler().fit(past_df[['n_citation_clipped', 'year']])
     enc = OneHotEncoder(handle_unknown='ignore', sparse_output=False).fit(past_df[['fos.name']].fillna('Unknown'))
@@ -125,43 +129,31 @@ for i in range(len(time_steps)-1):
     ])
     X_t = torch.FloatTensor(X_stack).to(DEVICE)
 
-    # Adjacency
     adj_matrix = nx.adjacency_matrix(G, nodelist=[idx_to_id_global[gi] for gi in global_indices])
-    
-    # Normalization & Conversion
-    def quick_norm(adj):
-        adj = adj + sp.eye(adj.shape[0])
-        d_inv = np.power(np.array(adj.sum(1)), -0.5).flatten()
-        d_inv[np.isinf(d_inv)] = 0.
-        d_mat = sp.diags(d_inv)
-        return d_mat.dot(adj).dot(d_mat).tocoo()
-    
     adj_norm = quick_norm(adj_matrix)
-    indices = torch.from_numpy(np.vstack((adj_norm.row, adj_norm.col)).astype(np.int64))
-    values = torch.from_numpy(adj_norm.data.astype(np.float32))
     
-    # Propagation
+    # FIX: Ensure indices are int64 (Long)
+    indices = torch.from_numpy(np.vstack((adj_norm.row, adj_norm.col)).astype(np.int64)).to(DEVICE)
+    values = torch.from_numpy(adj_norm.data.astype(np.float32)).to(DEVICE)
+    
     sgconv = PageRankAgg(K=K_PROP, alpha=ALPHA, add_self_loops=False).to(DEVICE)
-    X_gconv, _ = sgconv(X_t, indices.to(DEVICE), values.to(DEVICE))
+    X_gconv, _ = sgconv(X_t, indices, values)
 
-    # Model
     model = LLGC(X_gconv.size(1), EMBEDDING_DIM, 0.0, 1).to(DEVICE)
-    model = train_unsupervised_with_prior(model, X_gconv, indices, global_indices, 
-                                          embedding_registry, epochs=50) # פחות אפוקים למהירות
+    model = train_unsupervised_with_prior(model, X_gconv, indices, global_indices, embedding_registry, epochs=50)
     
     model.eval()
     with torch.no_grad():
         Z_t = model(X_gconv).cpu()
     
-    # Update Registry
     for idx, pid in enumerate(current_ids):
         embedding_registry[pid] = Z_t[idx]
 
     print(f"Segment up to {t_end} processed.")
 
-# --------------------------
-# 6. Injection & Final Detection
-# --------------------------
+# ---------------------------------------------------------
+# 6. Injection & Final Detection (FIXED Runtime Error)
+# ---------------------------------------------------------
 print("\nInjecting Synthetic Nodes...")
 df_fake = pd.read_csv("fakes.csv")
 df_fake['is_synthetic'] = True
@@ -169,7 +161,6 @@ df_aug = pd.concat([df, df_fake], ignore_index=True)
 df_aug['text_combined'] = df_aug['title'].fillna('') + ' ' + df_aug['abstract'].fillna('')
 df_aug['n_citation_clipped'] = df_aug['n_citation'].clip(upper=500)
 
-# בניית הפיצ'רים הסופיים (Apply בלבד)
 X_final_stack = np.hstack([
     vec.transform(df_aug['text_combined']).toarray(),
     scal.transform(df_aug[['n_citation_clipped', 'year']]),
@@ -177,7 +168,6 @@ X_final_stack = np.hstack([
 ])
 X_final = torch.FloatTensor(X_final_stack).to(DEVICE)
 
-# בניית גרף אוגמנטד (קוד ה-Adjacency שלך)
 aug_id_to_idx = {pid: i for i, pid in enumerate(df_aug['id'])}
 r, c = [], []
 for i, row in df_aug.iterrows():
@@ -185,21 +175,24 @@ for i, row in df_aug.iterrows():
         if ref in aug_id_to_idx:
             r += [i, aug_id_to_idx[ref]]
             c += [aug_id_to_idx[ref], i]
-adj_aug = quick_norm(sp.coo_matrix((np.ones(len(r)), (r, c)), shape=(len(df_aug), len(df_aug))))
 
-# Final Pass
-X_gconv_aug, _ = sgconv(X_final, torch.from_numpy(np.vstack((adj_aug.row, adj_aug.col))).to(DEVICE), 
-                         torch.from_numpy(adj_aug.data.astype(np.float32)).to(DEVICE))
+adj_aug_raw = sp.coo_matrix((np.ones(len(r)), (r, c)), shape=(len(df_aug), len(df_aug)))
+adj_aug = quick_norm(adj_aug_raw)
 
+# --- FIX: explicitly cast indices to int64 (Long) to resolve RuntimeError ---
+indices_aug = torch.from_numpy(np.vstack((adj_aug.row, adj_aug.col)).astype(np.int64)).to(DEVICE)
+values_aug = torch.from_numpy(adj_aug.data.astype(np.float32)).to(DEVICE)
+
+X_gconv_aug, _ = sgconv(X_final, indices_aug, values_aug)
+
+model.eval()
 with torch.no_grad():
     Z_final = model(X_gconv_aug).cpu().numpy()
 
-# Detection
 contamination = 0.06
 clf = IsolationForest(contamination=contamination, random_state=42)
 pred = clf.fit_predict(Z_final)
 
-# Results
 fake_indices = df_aug[df_aug['is_synthetic'] == True].index
 detected = sum(1 for idx in fake_indices if pred[idx] == -1)
 print(f"\n🔥 Final Result: {detected}/{len(fake_indices)} ({detected/len(fake_indices):.1%})")
