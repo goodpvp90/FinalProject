@@ -46,9 +46,8 @@ def ensure_column(df, col, default=False):
 # ======================================================
 df = pd.read_csv("final_filtered_by_fos_and_reference.csv")
 
-df['references'] = df['references'].apply(
-    lambda x: ast.literal_eval(x) if pd.notna(x) else []
-)
+df['references'] = df['references'].apply(safe_parse_references)
+
 
 df['year'] = df['year'].astype(int)
 df = ensure_column(df, 'is_synthetic', False)
@@ -106,6 +105,31 @@ def build_structural_features(G, id_to_idx):
 
 X = build_structural_features(G, id_to_idx)
 X = torch.tensor(X, dtype=torch.float32).to(DEVICE)
+
+
+def safe_parse_references(x):
+    """
+    Safely parse references field.
+    Returns a list or empty list.
+    """
+    if isinstance(x, list):
+        return x
+
+    if not isinstance(x, str):
+        return []
+
+    x = x.strip()
+
+    # empty or invalid
+    if len(x) == 0 or x[0] != '[' or x[-1] != ']':
+        return []
+
+    try:
+        parsed = ast.literal_eval(x)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
 
 # ======================================================
 # 6. Adjacency Utilities
@@ -220,7 +244,7 @@ G2 = nx.DiGraph()
 for _, r in df.iterrows():
     G2.add_node(r['id'])
 for _, r in df.iterrows():
-    for ref in ast.literal_eval(str(r['references'])):
+    for ref in safe_parse_references(r['references']):
         if ref in G2:
             G2.add_edge(r['id'], ref)
 
