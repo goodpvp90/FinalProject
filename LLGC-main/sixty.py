@@ -224,7 +224,28 @@ for idx, row_data in df_aug.iterrows():
 # Save the final results to a CSV
 pd.DataFrame(all_results_rows).to_csv("temporal_anomaly_results_final.csv", index=False)
 print("\n✅ Results saved to: temporal_anomaly_results_final.csv")
-# -------------------------------------------------
+
+# --- TSNE Visualization (2D) ---
+try:
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+    Z_2d = tsne.fit_transform(Z_final)
+    normal_mask = (pred == 1)
+    anomaly_mask = (pred == -1)
+    plt.figure(figsize=(8, 6))
+    plt.scatter(Z_2d[normal_mask, 0], Z_2d[normal_mask, 1], s=10, c='blue', label='Normal', alpha=0.5)
+    plt.scatter(Z_2d[anomaly_mask, 0], Z_2d[anomaly_mask, 1], s=20, c='red', label='Anomaly', alpha=0.7)
+    plt.title('t-SNE of Paper Embeddings (Normal vs Anomaly)')
+    plt.xlabel('TSNE-1')
+    plt.ylabel('TSNE-2')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('tsne_papers.png', dpi=150)
+    plt.show()
+    print("\n🖼️ t-SNE plot saved as tsne_papers.png")
+except Exception as e:
+    print(f"[TSNE Plot Error] {e}")
 
 fake_indices = df_aug[df_aug['is_synthetic'] == True].index
 detected = sum(1 for idx in fake_indices if pred[idx] == -1)
