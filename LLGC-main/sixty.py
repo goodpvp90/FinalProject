@@ -11,6 +11,7 @@ import os
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import IsolationForest
+from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
 
 # Import your custom modules
 from model import LLGC, PageRankAgg
@@ -211,15 +212,25 @@ pred = clf.fit_predict(Z_final)
 
 # --- ADDED: Record final scores after injection ---
 scores_final = clf.decision_function(Z_final)
-for idx, row_data in df_aug.iterrows():
-    all_results_rows.append({
-        "paper_id": row_data['id'],
-        "t_start": "POST_INJECTION",
-        "t_end": "POST_INJECTION",
-        "anomaly_score": scores_final[idx],
-        "prediction": pred[idx],
-        "is_synthetic": row_data.get('is_synthetic', False)
-    })
+
+# --------------------------
+# 7. Evaluation Metrics
+# --------------------------
+
+# Ground truth: synthetic = anomaly
+y_true = df_aug['is_synthetic'].fillna(False).astype(int).values
+
+# Model output: IsolationForest (-1 = anomaly, 1 = normal)
+y_pred = np.where(pred == -1, 1, 0)
+
+precision = precision_score(y_true, y_pred, zero_division=0)
+recall = recall_score(y_true, y_pred, zero_division=0)
+f1 = f1_score(y_true, y_pred, zero_division=0)
+
+print("\n📊 Final Detection Metrics (POST_INJECTION)")
+print(f"Precision: {precision:.4f}")
+print(f"Recall:    {recall:.4f}")
+print(f"F1-score:  {f1:.4f}")
 
 # Save the final results to a CSV
 pd.DataFrame(all_results_rows).to_csv("temporal_anomaly_results_final.csv", index=False)

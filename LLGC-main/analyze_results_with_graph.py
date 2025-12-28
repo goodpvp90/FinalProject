@@ -2,8 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # load results
-df = pd.read_csv("C:\\Users\\nadir\\FinalProject\\temporal_anomaly_results_real_only.csv")
-
+df = pd.read_csv("temporal_anomaly_results_final.csv")
 df.head()
 # Plot 1: anomaly score distribution
 plt.figure(figsize=(8,5))

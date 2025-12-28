@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Load your results file
-df = pd.read_csv("temporal_anomaly_results_real_only.csv")
+df = pd.read_csv("temporal_anomaly_results_final.csv")
 
 # Only real papers
 df = df[df["is_synthetic"] == False]
