@@ -206,13 +206,12 @@ model.eval()
 with torch.no_grad():
     Z_final = model(X_gconv_aug).cpu().numpy()
 
-contamination = 0.0065
+contamination = 0.024
 clf = IsolationForest(contamination=contamination, random_state=42)
 pred = clf.fit_predict(Z_final)
 
 # --- ADDED: Record final scores after injection ---
 scores_final = clf.decision_function(Z_final)
-
 # --------------------------
 # 7. Evaluation Metrics
 # --------------------------
@@ -223,6 +222,7 @@ y_true = df_aug['is_synthetic'].fillna(False).astype(int).values
 # Model output: IsolationForest (-1 = anomaly, 1 = normal)
 y_pred = np.where(pred == -1, 1, 0)
 
+# ---- Standard Metrics (UNCHANGED) ----
 precision = precision_score(y_true, y_pred, zero_division=0)
 recall = recall_score(y_true, y_pred, zero_division=0)
 f1 = f1_score(y_true, y_pred, zero_division=0)
@@ -261,3 +261,73 @@ except Exception as e:
 fake_indices = df_aug[df_aug['is_synthetic'] == True].index
 detected = sum(1 for idx in fake_indices if pred[idx] == -1)
 print(f"\n🔥 Final Result: {detected}/{len(fake_indices)} ({detected/len(fake_indices):.1%})")
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import precision_recall_curve
+import pandas as pd
+import numpy as np
+
+sns.set(style="whitegrid")
+
+# -------------------------------
+# 1. Anomaly Score Distribution
+# -------------------------------
+real_scores = scores_final[y_true == 0]
+fake_scores = scores_final[y_true == 1]
+
+plt.figure(figsize=(8, 5))
+sns.histplot(real_scores, bins=50, kde=True, color="blue", label="Real", stat="density", alpha=0.5)
+sns.histplot(fake_scores, bins=50, kde=True, color="red", label="Synthetic", stat="density", alpha=0.6)
+plt.axvline(0, color="black", linestyle="--", linewidth=1)
+plt.title("Anomaly Score Distribution")
+plt.xlabel("IsolationForest Score")
+plt.ylabel("Density")
+plt.legend()
+plt.tight_layout()
+plt.savefig("anomaly_score_distribution.png", dpi=150)
+plt.show()
+
+results_df = pd.DataFrame(all_results_rows)
+
+# Create safe lookup from final augmented dataframe
+synthetic_lookup = dict(zip(df_aug["id"], df_aug["is_synthetic"]))
+
+# Add is_synthetic column safely
+results_df["is_synthetic"] = results_df["paper_id"].map(synthetic_lookup).fillna(False)
+
+# ------------------------------------------------
+# 6. Citation Count vs Anomaly Score (Sanity Check)
+# ------------------------------------------------
+plt.figure(figsize=(7, 5))
+plt.scatter(
+    df_aug["n_citation_clipped"],
+    scores_final,
+    c=y_true,
+    cmap="coolwarm",
+    alpha=0.6
+)
+plt.xlabel("Citation Count (Clipped)")
+plt.ylabel("Anomaly Score")
+plt.title("Citation Count vs Anomaly Score")
+plt.colorbar(label="Synthetic (1) / Real (0)")
+plt.tight_layout()
+plt.savefig("citation_vs_anomaly.png", dpi=150)
+plt.show()
+
+
+# ------------------------------------------
+# 7. Confusion Matrix
+# ------------------------------------------
+from sklearn.metrics import confusion_matrix
+
+cm = confusion_matrix(y_true, y_pred)
+
+plt.figure(figsize=(5, 4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix")
+plt.tight_layout()
+plt.savefig("confusion_matrix.png", dpi=150)
+plt.show()
