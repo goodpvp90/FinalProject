@@ -233,8 +233,8 @@ print(f"Recall:    {recall:.4f}")
 print(f"F1-score:  {f1:.4f}")
 
 # Save the final results to a CSV
-pd.DataFrame(all_results_rows).to_csv("temporal_anomaly_results_final.csv", index=False)
-print("\n✅ Results saved to: temporal_anomaly_results_final.csv")
+pd.DataFrame(all_results_rows).to_csv("temporal_anomaly_results.csv", index=False)
+print("\n✅ Results saved to: temporal_anomaly_results.csv")
 
 # --- TSNE Visualization (2D) ---
 try:
