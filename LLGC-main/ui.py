@@ -26,10 +26,10 @@ if st.button("Run Pipeline"):
         with st.spinner("Running pipeline..."):
             result = run_pipeline(dataset_path, progress_cb=ui_logger)
 
-            st.subheader("📊 Final Metrics")
+            st.subheader("Final Metrics")
             st.json(result["metrics"])
 
-            st.subheader("🖼️ Visualizations")
+            st.subheader("🖼Visualizations")
             for fig in result["figures"]:
                 st.image(fig, width=600)
 

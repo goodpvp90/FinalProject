@@ -10,7 +10,6 @@ def run_pipeline(dataset_path, progress_cb=None):
     import ast
     import numpy as np
     import torch
-    import torch.nn as nn
     import torch.optim as optim
     import scipy.sparse as sp
     import random
@@ -18,9 +17,7 @@ def run_pipeline(dataset_path, progress_cb=None):
     from sklearn.preprocessing import StandardScaler, OneHotEncoder
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.ensemble import IsolationForest
-    from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
-
-    # Import your custom modules
+    from sklearn.metrics import precision_score, recall_score, f1_score
     from model import LLGC, PageRankAgg
 
     # --------------------------
@@ -64,7 +61,7 @@ def run_pipeline(dataset_path, progress_cb=None):
     time_steps = list(range(years.min(), years.max() + DELTA_T, DELTA_T))
 
     # --------------------------
-    # 4. Training Function
+    # Training Function
     # --------------------------
     def train_unsupervised_with_prior(model, X_features, adj_indices, global_indices,
                                       embedding_registry=None, epochs=100, lr=0.01):
@@ -101,7 +98,7 @@ def run_pipeline(dataset_path, progress_cb=None):
         return model
 
     # --------------------------
-    # 5. Main Loop
+    # 4. Main Loop
     # --------------------------
     K_PROP, ALPHA, EMBEDDING_DIM = 5, 0.8, 128
     embedding_registry = {}
@@ -130,6 +127,7 @@ def run_pipeline(dataset_path, progress_cb=None):
         scal = StandardScaler().fit(past_df[['n_citation_clipped', 'year']])
         enc = OneHotEncoder(handle_unknown='ignore', sparse_output=False).fit(past_df[['fos.name']].fillna('Unknown'))
 
+        #single feature vector per paper
         X_stack = np.hstack([
             vec.transform(past_df['text_combined']).toarray(),
             scal.transform(past_df[['n_citation_clipped', 'year']]),
@@ -140,7 +138,6 @@ def run_pipeline(dataset_path, progress_cb=None):
         adj_matrix = nx.adjacency_matrix(G, nodelist=[idx_to_id_global[gi] for gi in global_indices])
         adj_norm = quick_norm(adj_matrix)
 
-        # FIX: Ensure indices are int64 (Long)
         indices = torch.from_numpy(np.vstack((adj_norm.row, adj_norm.col)).astype(np.int64)).to(DEVICE)
         values = torch.from_numpy(adj_norm.data.astype(np.float32)).to(DEVICE)
 
@@ -154,7 +151,7 @@ def run_pipeline(dataset_path, progress_cb=None):
         with torch.no_grad():
             Z_t = model(X_gconv).cpu()
 
-        # --- ADDED: Record anomaly scores for this temporal segment ---
+        #Record anomaly scores for this temporal segment
         clf_temp = IsolationForest(contamination=0.01, random_state=42)
         pred_temp = clf_temp.fit_predict(Z_t.numpy())
         scores_temp = clf_temp.decision_function(Z_t.numpy())
@@ -176,9 +173,11 @@ def run_pipeline(dataset_path, progress_cb=None):
         report(f"Segment up to {t_end} processed.")
 
     # ---------------------------------------------------------
-    # 6. Injection & Final Detection (FIXED Runtime Error)
+    # 5. Injection & Final Detection
     # ---------------------------------------------------------
     report("\nInjecting Synthetic Nodes...")
+
+    df['is_synthetic'] = False
     df_fake = pd.read_csv("fakes.csv")
     df_fake['is_synthetic'] = True
     df_aug = pd.concat([df, df_fake], ignore_index=True)
@@ -203,7 +202,6 @@ def run_pipeline(dataset_path, progress_cb=None):
     adj_aug_raw = sp.coo_matrix((np.ones(len(r)), (r, c)), shape=(len(df_aug), len(df_aug)))
     adj_aug = quick_norm(adj_aug_raw)
 
-    # --- FIX: explicitly cast indices to int64 (Long) to resolve RuntimeError ---
     indices_aug = torch.from_numpy(np.vstack((adj_aug.row, adj_aug.col)).astype(np.int64)).to(DEVICE)
     values_aug = torch.from_numpy(adj_aug.data.astype(np.float32)).to(DEVICE)
 
@@ -217,10 +215,24 @@ def run_pipeline(dataset_path, progress_cb=None):
     clf = IsolationForest(contamination=contamination, random_state=42)
     pred = clf.fit_predict(Z_final)
 
-    # --- ADDED: Record final scores after injection ---
+    #Record final scores after injection
     scores_final = clf.decision_function(Z_final)
+
+    # ---------------------------------------------------------
+    # Add final (augmented) results INCLUDING synthetic papers
+    # ---------------------------------------------------------
+    for idx, pid in enumerate(df_aug['id']):
+        all_results_rows.append({
+            "paper_id": pid,
+            "t_start": "final",
+            "t_end": "final",
+            "anomaly_score": scores_final[idx],
+            "prediction": pred[idx],
+            "is_synthetic": df_aug.iloc[idx]['is_synthetic']
+        })
+
     # --------------------------
-    # 7. Evaluation Metrics
+    # 6. Evaluation Metrics
     # --------------------------
 
     # Ground truth: synthetic = anomaly
@@ -229,20 +241,18 @@ def run_pipeline(dataset_path, progress_cb=None):
     # Model output: IsolationForest (-1 = anomaly, 1 = normal)
     y_pred = np.where(pred == -1, 1, 0)
 
-    # ---- Standard Metrics (UNCHANGED) ----
+    # Standard Metrics
     precision = precision_score(y_true, y_pred, zero_division=0)
     recall = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
-
-    report("\n📊 Final Detection Metrics (POST_INJECTION)")
-    report(f"Precision: {precision:.4f}")
-    report(f"Recall:    {recall:.4f}")
-    report(f"F1-score:  {f1:.4f}")
 
     # Save the final results to a CSV
     pd.DataFrame(all_results_rows).to_csv("temporal_anomaly_results.csv", index=False)
     report("\n✅ Results saved to: temporal_anomaly_results.csv")
 
+    # --------------------------
+    # 7. Graphs
+    # --------------------------
     # --- TSNE Visualization (2D) ---
     try:
         import matplotlib.pyplot as plt
@@ -260,8 +270,8 @@ def run_pipeline(dataset_path, progress_cb=None):
         plt.legend()
         plt.tight_layout()
         plt.savefig('tsne_papers.png', dpi=150)
-        plt.show()
-        report("\n🖼️ t-SNE plot saved as tsne_papers.png")
+        plt.close()
+        report("\nt-SNE plot saved as tsne_papers.png")
     except Exception as e:
         report(f"[TSNE Plot Error] {e}")
 
@@ -293,7 +303,7 @@ def run_pipeline(dataset_path, progress_cb=None):
     plt.legend()
     plt.tight_layout()
     plt.savefig("anomaly_score_distribution.png", dpi=150)
-    plt.show()
+    plt.close()
 
     results_df = pd.DataFrame(all_results_rows)
 
@@ -306,22 +316,36 @@ def run_pipeline(dataset_path, progress_cb=None):
     # ------------------------------------------------
     # 6. Citation Count vs Anomaly Score (Sanity Check)
     # ------------------------------------------------
+    real_mask = df_aug["is_synthetic"] == False
+    fake_mask = df_aug["is_synthetic"] == True
+
     plt.figure(figsize=(7, 5))
+
+    # Real papers (lighter + transparent)
     plt.scatter(
-        df_aug["n_citation_clipped"],
-        scores_final,
-        c=y_true,
-        cmap="coolwarm",
-        alpha=0.6
+        df_aug.loc[real_mask, "n_citation_clipped"],
+        scores_final[real_mask],
+        alpha=0.2,
+        s=10,
+        label="Real"
     )
+
+    # Fake papers (big + strong color, drawn LAST)
+    plt.scatter(
+        df_aug.loc[fake_mask, "n_citation_clipped"],
+        scores_final[fake_mask],
+        s=80,
+        alpha=1.0,
+        label="Fake"
+    )
+
     plt.xlabel("Citation Count (Clipped)")
     plt.ylabel("Anomaly Score")
     plt.title("Citation Count vs Anomaly Score")
-    plt.colorbar(label="Synthetic (1) / Real (0)")
+    plt.legend()
     plt.tight_layout()
     plt.savefig("citation_vs_anomaly.png", dpi=150)
-    plt.show()
-
+    plt.close()
 
     # ------------------------------------------
     # 7. Confusion Matrix
@@ -337,7 +361,7 @@ def run_pipeline(dataset_path, progress_cb=None):
     plt.title("Confusion Matrix")
     plt.tight_layout()
     plt.savefig("confusion_matrix.png", dpi=150)
-    plt.show()
+    plt.close()
 
     return {
         "metrics": {
